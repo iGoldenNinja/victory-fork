@@ -22,6 +22,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
 mod trigger;
+pub(crate) mod pass;
 
 pub(crate) fn poll_trigger(presenting: u64) {
     trigger::poll(presenting);

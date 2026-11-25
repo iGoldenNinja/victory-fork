@@ -1924,6 +1924,8 @@ struct Deferred {
     indirect_traces: Vec<crate::indirect::DispatchTrace>,
     #[cfg(feature = "diagnostics")]
     light_samples: Vec<crate::light_probe::Readback>,
+    #[cfg(feature = "diagnostics")]
+    pass_regions: Vec<crate::capture::pass::Region>,
     /// Whether the indirect-work budget is zeroed for this recording (a
     /// step on the CPU, or in the list for the card's copy).
     budget_zeroed: bool,
@@ -3581,6 +3583,10 @@ fn read_backs(list: &HostList) {
     #[cfg(feature = "diagnostics")]
     for sample in &deferred.light_samples {
         sample.report();
+    }
+    #[cfg(feature = "diagnostics")]
+    for region in &deferred.pass_regions {
+        region.report();
     }
     for back in &deferred.texture_backs {
         crate::texback::land(back);
@@ -6514,6 +6520,19 @@ impl HostList {
     #[cfg(feature = "diagnostics")]
     pub(crate) fn defer_light_sample(&self, sample: crate::light_probe::Readback) {
         self.deferred().light_samples.push(sample);
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn pass_texture_state(&self, resource: crate::object::This) -> Option<(std::sync::Arc<crate::resource::HostTexture>, D3D12_RESOURCE_STATES)> {
+        let texture = crate::resource::host_made(resource)?;
+        self.states.lock().unwrap_or_else(|e| e.into_inner()).values()
+            .find(|(_, _, copy)| &copy.texture == texture)
+            .map(|(_, state, copy)| (copy.clone(), D3D12_RESOURCE_STATES(*state as i32)))
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn defer_pass_region(&self, region: crate::capture::pass::Region) {
+        self.deferred().pass_regions.push(region);
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
