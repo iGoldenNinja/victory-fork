@@ -1917,6 +1917,8 @@ struct Deferred {
     backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
     #[cfg(feature = "diagnostics")]
     indirect_traces: Vec<crate::indirect::DispatchTrace>,
+    #[cfg(feature = "diagnostics")]
+    light_samples: Vec<crate::light_probe::Readback>,
     /// Whether the indirect-work budget is zeroed for this recording (a
     /// step on the CPU, or in the list for the card's copy).
     budget_zeroed: bool,
@@ -3570,6 +3572,10 @@ fn read_backs(list: &HostList) {
     #[cfg(feature = "diagnostics")]
     for trace in &deferred.indirect_traces {
         trace.report();
+    }
+    #[cfg(feature = "diagnostics")]
+    for sample in &deferred.light_samples {
+        sample.report();
     }
     for (buffer, at, [row, rows, pitch]) in &deferred.backs {
         let mut data = std::ptr::null_mut();
@@ -6449,6 +6455,27 @@ impl HostList {
     #[cfg(feature = "diagnostics")]
     pub(crate) fn defer_indirect_trace(&self, trace: crate::indirect::DispatchTrace) {
         self.deferred().indirect_traces.push(trace);
+    }
+
+    /// Only an existing host texture which this list already tracks as a UAV.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn probe_source(
+        &self,
+        resource: crate::object::This,
+    ) -> Option<std::sync::Arc<crate::resource::HostTexture>> {
+        let texture = crate::resource::host_made(resource)?;
+        let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        states
+            .values()
+            .find(|(_, state, copy)| {
+                *state == D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32 && &copy.texture == texture
+            })
+            .map(|(_, _, copy)| copy.clone())
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn defer_light_sample(&self, sample: crate::light_probe::Readback) {
+        self.deferred().light_samples.push(sample);
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.

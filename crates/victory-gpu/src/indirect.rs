@@ -910,6 +910,15 @@ void main() {
         worker: Clamp,
     }
 
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn light_probe_reads_original_packed_rows_on_warp() {
+        let mut warp = WarpHarness::new().expect("WARP is required for the light probe fixture");
+        let device = warp.device.clone();
+        let list = warp.list.clone();
+        crate::light_probe::tests::check_readback(&device, &list, || warp.submit_and_wait());
+    }
+
     impl WarpHarness {
         fn new() -> Option<Self> {
             // SAFETY: plain DXGI WARP query and D3D12 test harness setup.

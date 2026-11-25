@@ -2123,6 +2123,27 @@ impl State {
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        if let Some(stage) = p.stages.first()
+            && let Some(sequence) = crate::light_probe::sample(&stage.shader.hash)
+        {
+            let named = stage.translated().used.iter().any(|u| {
+                u.kind == ResourceType::Uav
+                    && u.root == RootType::Table
+                    && (u.slot, u.table_offset_dwords) == (1, 176)
+            });
+            let Some(Root::Table(table)) = self.roots_ref(true).get(1).filter(|_| named) else {
+                once!("light probe skipped: resolve has no UAV at table 1 dword 176");
+                return;
+            };
+            let view = table
+                .checked_add(176 * 4)
+                .filter(|&h| {
+                    self.heap_of(h).is_some() && crate::texture::committed(h as *const u8, 12)
+                })
+                .and_then(crate::descriptor::view);
+            crate::light_probe::record(list, view, sequence);
+        }
     }
 
     /// What a draw or dispatch runs, for the device-removed report
