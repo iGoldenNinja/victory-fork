@@ -2,6 +2,8 @@
 
 **The tile generator dropped work that its own eligibility mask requested.** Reserving one slot per eligible tile restored the missing water in the RTX 5080 boat replay, both at the helm and under throttle. The fix changes tile-list allocation. Both volumetric writers and the final water shader used their original programs. [Matched results and local build instructions](#repairing-the-work-list)
 
+A separate stock replay captured the list and both counters immediately after the generator ran. The omissions were already present. Both water writers received identical bytes and group counts in every matched dispatch. [GPU output measurements](#where-the-stock-list-first-loses-tiles)
+
 All 495 coordinates from the previously reported isolated water patch turned from colored to exact packed zero again on an RTX 5080. At every one, the water shader's bound depth SRV contained a positive finite float. A separate replay instrumented the shader itself. All 495 sites then reported an exact zero RGB result from the full shading calculation with nonzero final exposure. The zero-depth return and the alternate scene-copy path have distinct signatures. [Earlier measurement](rtx5080-water-frame-trace.md)
 
 ## Depth and the displayed image
@@ -137,3 +139,16 @@ The regular gameplay launcher started a fresh Series X run from the same verifie
 All 20 stationary window images across five minutes had zero qualifying dark runs in both preselected water regions, at both luminance thresholds. Eight of nine images from a separate stock replay had the runs in the left region. The corresponding left-region stock medians were 119 and 652 dark pixels. Under 52 seconds of throttle the repaired boat stayed afloat, accelerated toward the bridge and left two wakes. Seven moving images showed continuous water. The run closed deliberately and all nine protected profile files verified. Package pickup, seaplane flotation and mission completion are outside these observations.
 
 PresentMon measured **3.715 displayed FPS and 323.415 ms P99** over 300.105 seconds at the stationary helm, with 1,116 displayed application frames and 1,115 intervals. The previous stock-helm window measured 3.848 displayed FPS and 305.774 ms P99 over 300.122 seconds. Both timings fall below the local 29.5 FPS minimum and exceed the 40 ms P99 limit. The change in timing between these separate runs has no isolated attribution. The local gameplay launcher now selects the continuously repaired profile by default and retains the previous renderer as an explicit control.
+
+### Where the stock list first loses tiles
+
+On the same Series X save, renderer `9bf39c01c538d7e22a7f161e66d6fcb46f3e0674` translated the original generator `1aa247ed3653b616`. An opt-in diagnostic copied its dword 32 list and its dword 24 counters immediately after dispatch. We compared all 14,720 list words with both downstream reads of the same allocation, including the unused tail. We also compared the two generator counts with the actual front and reverse indirect dispatch group counts. The descriptor identities stayed stable through submission and fence completion. [Tested diagnostic source](https://github.com/iGoldenNinja/victory-fork/commit/9bf39c01c538d7e22a7f161e66d6fcb46f3e0674)
+
+| Stock replay | Matched dispatches | Eligible tile entries | Eligible entries already missing | Duplicate entries | Listed outside eligibility | Both later lists and counts matched |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Stationary helm | 70 | 524,365 | 41,285 | 3,672 | 40 | 70/70 |
+| Under throttle | 77 | 543,209 | 17,885 | 12,561 | 272 | 77/77 |
+
+All 147 dispatches lost eligible tiles at generation. The dword 40 OR mask matched its inputs throughout. The reverse counter stayed zero. Each writer received all 2,163,840 sampled list words unchanged across the run. The 495 original sites turned black together in seven stationary dispatches and one moving dispatch. In all eight, every one of the four samples for each site pointed to an eligible tile already missing from the list.
+
+This locates the loss by the end of the stock generator dispatch, before the downstream argument and list reads. The standalone tests above still leave the specific wave or compiler operation responsible unresolved. The physical trace used an isolated profile and all nine protected files verified after closure.
