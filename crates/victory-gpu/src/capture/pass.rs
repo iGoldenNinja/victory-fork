@@ -16,7 +16,7 @@ pub(crate) struct Config {
     pub(super) rect: [u32; 4],
 }
 
-fn parse(text: &str) -> Option<Config> {
+pub(super) fn parse(text: &str) -> Option<Config> {
     let mut fields = text.split(',').map(str::trim);
     let hash = fields.next()?;
     if hash.len() != 16 || !hash.bytes().all(|c| c.is_ascii_hexdigit()) { return None; }
@@ -87,7 +87,7 @@ impl Texture {
             || u64::from(x + w) > d.Width || y + h > d.Height { return None; }
         let bpp = match d.Format {
             DXGI_FORMAT_R11G11B10_FLOAT | DXGI_FORMAT_R10G10B10A2_UNORM | DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R32_FLOAT
-            | DXGI_FORMAT_R32_TYPELESS | DXGI_FORMAT_D32_FLOAT => 4,
+            | DXGI_FORMAT_R32_TYPELESS | DXGI_FORMAT_R32_UINT | DXGI_FORMAT_D32_FLOAT => 4,
             DXGI_FORMAT_R16G16B16A16_FLOAT => 8,
             _ => return None,
         };

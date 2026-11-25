@@ -40,7 +40,7 @@ pub(crate) fn active(frame: u64) -> bool {
         && enabled() && super::pass::config().is_some()
 }
 
-pub(crate) fn enabled() -> bool { readers().is_some() || super::producer::config().is_some() }
+pub(crate) fn enabled() -> bool { readers().is_some() || super::producer::config().is_some() || super::producer::mask().is_some() }
 
 pub(crate) struct Target {
     pub table: u8,
@@ -51,16 +51,22 @@ pub(crate) struct Target {
     pub extra_dword: Option<u32>,
     pub feed_constant: Option<u32>,
     producer: bool,
+    mask: bool,
     rect: [u32; 4],
 }
 
 pub(crate) fn target(hash: &str, compute: bool) -> Option<Target> {
     let pass = super::pass::config()?;
     let upstream = super::producer::config();
+    if compute && let Some((mask, list, cb)) = super::producer::mask() && mask.hash == hash {
+        return Some(Target { table: mask.table, dword: mask.uav, shader: mask.hash.as_str(), writer: true,
+            input_dword: Some(mask.srv), extra_dword: Some(*list), feed_constant: Some(*cb),
+            producer: false, mask: true, rect: mask.rect });
+    }
     if compute && let Some(cfg) = upstream
         && let Some(shader) = cfg.shaders.iter().find(|h| h.as_str() == hash) {
         return Some(Target { table: cfg.table, dword: cfg.output, shader, writer: true,
-            input_dword: Some(cfg.list), extra_dword: Some(cfg.constant), feed_constant: None, producer: true, rect: cfg.rect });
+            input_dword: Some(cfg.list), extra_dword: Some(cfg.constant), feed_constant: None, producer: true, mask: false, rect: cfg.rect });
     }
     let (table, dword, shader) = if compute {
         if pass.hash != hash { return None; }
@@ -73,7 +79,7 @@ pub(crate) fn target(hash: &str, compute: bool) -> Option<Target> {
     let extra_dword = upstream.filter(|cfg| compute && cfg.table == table).map(|cfg| cfg.downstream);
     Some(Target { table, dword, shader, writer: compute, input_dword: compute.then_some(pass.srv),
         extra_dword, feed_constant: upstream.filter(|_| extra_dword.is_some()).and_then(|c| c.downstream_constant),
-        producer: false, rect: pass.rect })
+        producer: false, mask: false, rect: pass.rect })
 }
 
 pub(crate) fn host_index(root_bytes: u32, dword: u32) -> Option<u32> {
@@ -185,14 +191,19 @@ impl Binding {
         if let Some((slot, view)) = self.extra {
             let resource = slot.resource();
             let extra_id = next_id();
-            let sampled = if t.producer {
+            let sampled = if t.mask {
+                // Observe only the destination list identity here. The downstream writers
+                // capture its contents through their SRV after this dispatch has finished.
+                false
+            } else if t.producer {
                 super::producer::sample_slot(list, &slot, view.as_ref(), frame, format!("slot-{id}-constants-before"))
             } else {
                 resource.as_ref().zip(super::producer::config()).is_some_and(|(r,cfg)|
                     super::pass::sample_native(list, r, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, frame,
                         format!("slot-{id}-feed-before"), cfg.rect))
             };
-            tracing::info!(id=extra_id, frame, role="extra-input", writer=id, shader=t.shader, dword=t.extra_dword,
+            let role = if t.mask { "list-target" } else { "extra-input" };
+            tracing::info!(id=extra_id, frame, role, writer=id, shader=t.shader, dword=t.extra_dword,
                 heap=slot.heap, index=slot.index, native=native(resource.as_ref()), sampled, "descriptor trace binding");
             list.defer_descriptor_event(Event { id: extra_id, frame, slot: Some(slot) });
         }

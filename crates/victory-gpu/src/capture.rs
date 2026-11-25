@@ -26,7 +26,7 @@ pub(crate) mod pass;
 pub(crate) mod lineage;
 mod producer;
 
-pub(crate) fn watches_upload_constants() -> bool { producer::config().is_some() }
+pub(crate) fn watches_upload_constants() -> bool { producer::config().is_some() || producer::mask().is_some() }
 
 pub(crate) fn poll_trigger(presenting: u64) {
     trigger::poll(presenting);

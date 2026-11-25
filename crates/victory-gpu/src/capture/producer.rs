@@ -53,6 +53,30 @@ pub(super) fn config() -> Option<&'static Config> {
     }).as_ref()
 }
 
+// A producer can classify tiles in a small mask before emitting an indirect list.
+// Use the same crop parser as other dispatch captures, followed by list and CBV offsets.
+fn parse_mask(text: &str) -> Option<(super::pass::Config, u32, u32)> {
+    let (fields, constant) = text.rsplit_once(',')?;
+    let (fields, list) = fields.rsplit_once(',')?;
+    let (list, constant) = (list.trim().parse::<u32>().ok()?, constant.trim().parse::<u32>().ok()?);
+    let pass = super::pass::parse(fields)?;
+    let slots = [pass.srv, pass.uav, list, constant];
+    if slots.iter().enumerate().any(|(i, d)| !d.is_multiple_of(8) || slots[..i].contains(d)) {
+        return None;
+    }
+    Some((pass, list, constant))
+}
+
+pub(super) fn mask() -> Option<&'static (super::pass::Config, u32, u32)> {
+    static MASK: OnceLock<Option<(super::pass::Config, u32, u32)>> = OnceLock::new();
+    MASK.get_or_init(|| {
+        let text = std::env::var("VICTORY_CAPTURE_MASK_PASS").ok()?;
+        let selection = parse_mask(&text);
+        if selection.is_none() { tracing::warn!("invalid tile-mask capture settings"); }
+        selection
+    }).as_ref()
+}
+
 /// Accept only a shader-visible slot that still retains the exact buffer whose
 /// GPU address and range the descriptor uses, including placed-buffer offsets.
 pub(super) fn sample_slot(list: &HostList, slot: &WatchedSlot, view: Option<&View>,
@@ -88,5 +112,15 @@ mod tests {
         assert!(parse(&valid.replace(",24,", ",24:24,")).is_none());
         assert!(parse(&valid.replace(",24,", ",24:81,")).is_none());
         assert!(parse(&valid.replace(",24,", ",24:80:88,")).is_none());
+    }
+
+    #[test]
+    fn parses_mask_textures_and_distinct_list_and_constant_offsets() {
+        let fields = "1234567890abcdef,1,8,40,0,0,20,23";
+        let (mask, list, cb) = parse_mask(&format!("{fields},32,48")).unwrap();
+        assert_eq!((mask.rect, list, cb), ([0,0,20,23], 32, 48));
+        assert!(parse_mask(&format!("{fields},32,32")).is_none());
+        assert!(parse_mask(&format!("{fields},8,48")).is_none());
+        assert!(parse_mask(&format!("{fields},33,48")).is_none());
     }
 }
