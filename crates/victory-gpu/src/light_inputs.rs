@@ -3,16 +3,20 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, OnceLock, Weak},
+    sync::{Arc, Mutex, OnceLock, Weak, atomic::{AtomicU64, Ordering}},
 };
 
 use victory_shader::{ResourceType, RootType, UsedResource};
 
 use crate::resource::HostTexture;
 
-pub(crate) fn sampled_frame() -> Option<u64> {
+pub(crate) fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("VICTORY_PROBE_LIGHT_INPUTS").is_some_and(|v| v == "1")) {
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PROBE_LIGHT_INPUTS").is_some_and(|v| v == "1"))
+}
+
+pub(crate) fn sampled_frame() -> Option<u64> {
+    if !enabled() {
         return None;
     }
     let frame = crate::frame::current();
@@ -36,8 +40,51 @@ struct Binding {
 pub(crate) struct Dispatch {
     frame: u64,
     hash: u64,
+    ordinal: Option<u64>,
     reads: Vec<Binding>,
     writes: Vec<Binding>,
+}
+
+pub(crate) struct Sample {
+    pub(crate) frame: u64,
+    pub(crate) ordinal: u64,
+    pub(crate) expected_output: Option<Weak<HostTexture>>,
+}
+
+#[derive(Default)]
+struct Selection {
+    latest_frame: AtomicU64,
+    ordinal: AtomicU64,
+}
+
+impl Selection {
+    fn claim(&self, frame: u64) -> Option<u64> {
+        if frame == 0 || !frame.is_multiple_of(32)
+            || self.latest_frame.fetch_max(frame, Ordering::Relaxed) >= frame
+        {
+            return None;
+        }
+        Some(self.ordinal.fetch_add(1, Ordering::Relaxed) + 1)
+    }
+}
+
+impl Dispatch {
+    /// Called only after recording a direct dispatch with nonzero group counts.
+    pub(crate) fn select(&mut self) -> Option<Sample> {
+        static SELECTION: OnceLock<Selection> = OnceLock::new();
+        if self.reads.is_empty() {
+            return None;
+        }
+        self.ordinal = SELECTION.get_or_init(Selection::default).claim(self.frame);
+        let Some(ordinal) = self.ordinal else {
+            self.reads.clear();
+            return None;
+        };
+        let expected_output = self.writes.iter()
+            .find(|binding| (binding.slot.root, binding.slot.dword) == (1, 176))
+            .and_then(|binding| binding.texture.clone());
+        Some(Sample { frame: self.frame, ordinal, expected_output })
+    }
 }
 
 pub(crate) fn bindings(
@@ -48,7 +95,7 @@ pub(crate) fn bindings(
 ) -> Option<Dispatch> {
     let resolve = hash == crate::light_probe::SHADER;
     let hash = u64::from_str_radix(hash, 16).ok()?;
-    let mut event = Dispatch { frame, hash, reads: vec![], writes: vec![] };
+    let mut event = Dispatch { frame, hash, ordinal: None, reads: vec![], writes: vec![] };
     for u in used.iter().filter(|u| u.root == RootType::Table) {
         let input = resolve && u.kind == ResourceType::Srv;
         if !input && u.kind != ResourceType::Uav {
@@ -142,7 +189,7 @@ pub(crate) fn completed(position: (u64, usize), events: &[Dispatch]) {
                 (Some(_), Some(_)) => "same texture as earlier tracked UAV",
             };
             tracing::info!(
-                frame = event.frame, submission = position.0, list = position.1,
+                frame = event.frame, submission = position.0, list = position.1, probe_ordinal = event.ordinal,
                 root = input.slot.root, dword = input.slot.dword, status,
                 untracked_reason = input.untracked_reason,
                 shape_format_width_height = ?input.shape,
@@ -165,6 +212,19 @@ pub(crate) fn completed(position: (u64, usize), events: &[Dispatch]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_resolves_select_one_command_per_sampled_frame() {
+        let selection = Selection::default();
+        assert!(selection.claim(0).is_none() && selection.claim(31).is_none());
+        let ordinals = std::thread::scope(|scope| {
+            let calls: Vec<_> = (0..8).map(|_| scope.spawn(|| selection.claim(32))).collect();
+            calls.into_iter().filter_map(|call| call.join().unwrap()).collect::<Vec<_>>()
+        });
+        assert_eq!(ordinals, [1]);
+        assert_eq!(selection.claim(64), Some(2));
+        assert!(selection.claim(32).is_none() && selection.claim(64).is_none());
+    }
 
     #[test]
     fn reports_untracked_resolve_inputs_and_filters_unobserved_outputs() {

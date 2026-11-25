@@ -22,8 +22,13 @@ fn enabled(value: Option<&std::ffi::OsStr>) -> bool {
     value.is_some_and(|v| v == "1")
 }
 
-/// Sample the first matching recorded dispatch and then every 64th after it.
-pub(crate) fn sample(hash: &str) -> Option<u64> {
+fn due(index: u64, with_inputs: bool, paired: bool) -> bool {
+    if with_inputs { paired } else { index.is_multiple_of(64) }
+}
+
+/// With input tracing, use the selected dispatch. Alone, sample the first
+/// matching recorded dispatch and then every 64th after it.
+pub(crate) fn sample(hash: &str, paired: bool) -> Option<u64> {
     static ON: OnceLock<bool> = OnceLock::new();
     static COUNT: AtomicU64 = AtomicU64::new(0);
     if !*ON.get_or_init(|| enabled(std::env::var_os("VICTORY_PROBE_LIGHT").as_deref()))
@@ -32,7 +37,7 @@ pub(crate) fn sample(hash: &str) -> Option<u64> {
         return None;
     }
     let index = COUNT.fetch_add(1, Ordering::Relaxed);
-    index.is_multiple_of(64).then_some(index + 1)
+    due(index, crate::light_inputs::enabled(), paired).then_some(index + 1)
 }
 
 macro_rules! reject {
@@ -43,7 +48,9 @@ macro_rules! reject {
     }};
 }
 
-pub(crate) fn record(list: &HostList, view: Option<View>, sequence: u64) {
+pub(crate) fn record(
+    list: &HostList, view: Option<View>, sequence: u64, paired: Option<crate::light_inputs::Sample>,
+) {
     let Some(View::Unordered(resource, 0, words)) = view else {
         reject!("light probe skipped: expected a texture UAV");
     };
@@ -66,6 +73,13 @@ pub(crate) fn record(list: &HostList, view: Option<View>, sequence: u64) {
     let Some(copy) = list.probe_source(resource as This) else {
         reject!("light probe skipped: texture is absent from this list's unordered-access state");
     };
+    if let Some(sample) = &paired
+        && !sample.expected_output.as_ref().is_some_and(|expected| {
+            expected.ptr_eq(&std::sync::Arc::downgrade(&copy))
+        })
+    {
+        reject!("light probe skipped: paired output lacks the matching reserved host UAV");
+    }
     let texture = &copy.texture;
     // SAFETY: the list owns the host copy.
     let d = unsafe { texture.GetDesc() };
@@ -105,7 +119,8 @@ pub(crate) fn record(list: &HostList, view: Option<View>, sequence: u64) {
         height: d.Height,
         rows,
         stride,
-        frame: crate::frame::current(),
+        frame: paired.as_ref().map_or_else(crate::frame::current, |s| s.frame),
+        ordinal: paired.map(|s| s.ordinal),
         sequence,
     };
     sample.copy_from(&list.list, texture);
@@ -146,6 +161,7 @@ pub(crate) struct Readback {
     rows: u32,
     stride: u32,
     frame: u64,
+    ordinal: Option<u64>,
     sequence: u64,
 }
 
@@ -228,13 +244,14 @@ impl Readback {
         Some((counts, zero_by_band))
     }
 
-    pub(crate) fn report(&self) {
+    pub(crate) fn report(&self, submission: u64, list: usize) {
         let Some((counts, zero_by_band)) = self.counts() else {
             reject!("light probe skipped: completed readback could not be mapped");
         };
         let zero_rgb: u32 = zero_by_band.iter().sum();
         let pixels = self.width * self.rows;
         tracing::info!(hash = SHADER, sequence = self.sequence, recorded_frame = self.frame,
+            probe_ordinal = self.ordinal, submission, list,
             format = "R32_UINT", width = self.width, height = self.height, sampled_rows = self.rows,
             pixels, zero_rgb, nonzero_rgb = pixels - zero_rgb, zero_words = counts.zero_words,
             zero_by_band = ?&zero_by_band[..self.rows as usize], nonzero_channels = ?counts.nonzero_channels,
@@ -244,6 +261,13 @@ impl Readback {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn paired_sampling_replaces_only_the_joint_mode_cadence() {
+        assert!(super::due(0, false, false) && super::due(64, false, false));
+        assert!(!super::due(1, false, false) && !super::due(63, false, true));
+        assert!(super::due(7, true, true) && !super::due(64, true, false));
+    }
+
     use super::*;
 
     #[test]
@@ -351,6 +375,7 @@ pub(crate) mod tests {
             rows: ROWS,
             stride: 512,
             frame: 0,
+            ordinal: None,
             sequence: 1,
         };
         // R, G and B differ by row. Column one has noncanonical black.

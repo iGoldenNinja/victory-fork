@@ -2181,14 +2181,18 @@ impl State {
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
-        if let Some(dispatch) = self.light_bindings.take()
+        let paired = if let Some(mut dispatch) = self.light_bindings.take()
             && x != 0 && y != 0 && z != 0
         {
+            let sample = dispatch.select();
             list.defer_light_bindings(dispatch);
-        }
+            sample
+        } else {
+            None
+        };
         #[cfg(feature = "diagnostics")]
         if let Some(stage) = p.stages.first()
-            && let Some(sequence) = crate::light_probe::sample(&stage.shader.hash)
+            && let Some(sequence) = crate::light_probe::sample(&stage.shader.hash, paired.is_some())
         {
             let named = stage.translated().used.iter().any(|u| {
                 u.kind == ResourceType::Uav
@@ -2205,7 +2209,7 @@ impl State {
                     self.heap_of(h).is_some() && crate::texture::committed(h as *const u8, 12)
                 })
                 .and_then(crate::descriptor::view);
-            crate::light_probe::record(list, view, sequence);
+            crate::light_probe::record(list, view, sequence, paired);
         }
     }
 

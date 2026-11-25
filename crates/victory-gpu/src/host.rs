@@ -3579,7 +3579,7 @@ fn read_backs(list: &HostList, _submission: u64, _ordinal: usize) {
     }
     #[cfg(feature = "diagnostics")]
     for sample in &deferred.light_samples {
-        sample.report();
+        sample.report(_submission, _ordinal);
     }
     for (buffer, at, [row, rows, pitch]) in &deferred.backs {
         let mut data = std::ptr::null_mut();
