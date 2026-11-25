@@ -61,7 +61,7 @@ enum Held {
     /// With [`present_behind`]: the title's present of a frame, due after
     /// what the queue holds before it: the host texture shown, the state
     /// the title's lists leave it in, and the frame's number.
-    Present(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32, u64),
+    Present(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32, u64, crate::present_trace::Trace),
 }
 
 /// Presents that are in a queue's line and have not run ([`Held::Present`]).
@@ -112,7 +112,7 @@ fn present_behind() -> bool {
 /// With [`present_behind`]: puts the present of the next frame behind what
 /// the queue `this` holds. False if it has to run the old way.
 #[cfg(windows)]
-fn send_behind(this: This, planes: u32, plane_parameters: *const Plane) -> bool {
+fn send_behind(this: This, planes: u32, plane_parameters: *const Plane, trace: crate::present_trace::Trace) -> bool {
     if this.is_null() || planes == 0 || PRESENTS_HELD.load(Ordering::Relaxed) != 0 {
         return false;
     }
@@ -142,7 +142,7 @@ fn send_behind(this: This, planes: u32, plane_parameters: *const Plane) -> bool 
     let texture = texture.clone();
     let sent = hold(this, || {
         PRESENTS_HELD.fetch_add(1, Ordering::Relaxed);
-        Held::Present(texture, state, frame)
+        Held::Present(texture, state, frame, trace)
     });
     if sent {
         PRESENTS_BEHIND.fetch_add(1, Ordering::Relaxed);
@@ -628,10 +628,12 @@ fn release_held_now(all: bool) {
                             }
                         }
                     }
-                    Held::Present(texture, state, frame) => {
+                    Held::Present(texture, state, frame, trace) => {
                         let show = || {
                             if let Some(host) = crate::host::host() {
-                                let _ = host.present(&texture, state, frame);
+                                let _ = host.present(&texture, state, frame, trace);
+                            } else {
+                                trace.skip(frame, "deferred_no_host");
                             }
                         };
                         if all {
@@ -850,6 +852,24 @@ pub(crate) struct Plane {
     count: u32,
     resources: *const This,
 }
+/// Returns the single resource that this queue presents for the title.
+#[cfg(windows)]
+fn first_plane_resource(planes: u32, parameters: *const Plane) -> Result<This, &'static str> {
+    if planes == 0 {
+        return Err("no_planes");
+    }
+    // SAFETY: a non-null pointer supplied by the caller describes the title's planes.
+    let plane = unsafe { parameters.as_ref() }.ok_or("null_planes")?;
+    if plane.count == 0 {
+        return Err("empty_plane");
+    }
+    if plane.resources.is_null() {
+        return Err("null_resources");
+    }
+    // SAFETY: the title supplies at least one resource pointer in this plane.
+    Ok(unsafe { *plane.resources })
+}
+
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
 extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
@@ -1020,16 +1040,18 @@ extern "system" fn present(
 ) -> HRESULT {
     #[cfg(windows)]
     let presenting = std::time::Instant::now();
-    let hr = present_now(this, planes, plane_parameters);
+    let trace = crate::present_trace::Trace::begin();
+    let (hr, frame, deferred) = present_now(this, planes, plane_parameters, trace);
     #[cfg(windows)]
     {
         crate::framelog::add(crate::framelog::T::PresentUs, presenting.elapsed().as_micros() as u64);
         crate::framelog::frame();
     }
+    trace.guest_end(frame, hr, deferred);
     hr
 }
 
-fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESULT {
+fn present_now(this: This, planes: u32, plane_parameters: *const Plane, trace: crate::present_trace::Trace) -> (HRESULT, u64, bool) {
     #[cfg(windows)]
     let presenting = std::time::Instant::now();
     #[cfg(all(windows, feature = "diagnostics"))]
@@ -1039,9 +1061,9 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
     // With `present_behind`: the frame is shown by our thread, behind what
     // the queue holds, and nothing is run or waited for here.
     #[cfg(windows)]
-    let sent_behind = present_behind() && send_behind(this, planes, plane_parameters);
+    let sent_behind = present_behind() && send_behind(this, planes, plane_parameters, trace);
     #[cfg(not(windows))]
-    let _ = this;
+    let sent_behind = { let _ = (this, trace); false };
     // Submissions sent to the card and not waited for are settled first,
     // and what that frees runs in its own order, before anything is forced.
     #[cfg(windows)]
@@ -1113,30 +1135,30 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
         }
     }
     #[cfg(windows)]
-    if !sent_behind
-        && planes > 0
-        // SAFETY: the title passes `planes` plane descriptions.
-        && let Some(plane) = unsafe { plane_parameters.as_ref() }
-        && plane.count > 0
-        && !plane.resources.is_null()
-        // SAFETY: the plane lists `count` resources.
-        && let resource = unsafe { *plane.resources }
-        && let Some(texture) = crate::resource::host_resource(resource)
-        && let Some(host) = crate::host::host()
-    {
-        const COPY_SOURCE: u32 = 0x800;
-        let state = crate::resource::host_transition(resource, COPY_SOURCE)
-            .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
-        crate::resource::host_transition(resource, state);
-        #[cfg(feature = "diagnostics")]
-        blinks(frame, resource, state, shown);
-        #[cfg(not(feature = "diagnostics"))]
-        let _ = shown;
+    if !sent_behind {
+        // Evaluate the original preconditions once, in their original order.
+        let show = || -> Result<(), &'static str> {
+            let resource = first_plane_resource(planes, plane_parameters)?;
+            let texture = crate::resource::host_resource(resource).ok_or("no_host_texture")?;
+            let host = crate::host::host().ok_or("no_host")?;
+            const COPY_SOURCE: u32 = 0x800;
+            let state = crate::resource::host_transition(resource, COPY_SOURCE)
+                .map_or(COPY_SOURCE, |(_, before)| before);
+            let shown = host.present(texture, state, frame, trace);
+            crate::resource::host_transition(resource, state);
+            #[cfg(feature = "diagnostics")]
+            blinks(frame, resource, state, shown);
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = shown;
+            Ok(())
+        };
+        if let Err(reason) = show() {
+            trace.skip(frame, reason);
+        }
     }
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
-    S_OK
+    (S_OK, frame, sent_behind)
 }
 /// Diagnostics: logs a presented frame that is black after one that was
 /// not, with what was presented and how many draws ran since.
@@ -1302,6 +1324,22 @@ static NEWER_FUNCTIONS: Table<36> = Table(queue_table(true));
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn present_qpc_distinguishes_plane_prechecks() {
+        let null = std::ptr::null();
+        assert_eq!(first_plane_resource(0, null), Err("no_planes"));
+        assert_eq!(first_plane_resource(1, null), Err("null_planes"));
+        let mut plane = Plane { token: 0, count: 0, resources: std::ptr::null() };
+        assert_eq!(first_plane_resource(1, &plane), Err("empty_plane"));
+        plane.count = 1;
+        assert_eq!(first_plane_resource(1, &plane), Err("null_resources"));
+        let resource: This = std::ptr::null_mut();
+        plane.resources = &resource;
+        assert_eq!(first_plane_resource(1, &plane), Ok(resource));
+    }
+
     use crate::object::slot;
 
     /// Where a queue's signal is: newer layouts have it two slots later.

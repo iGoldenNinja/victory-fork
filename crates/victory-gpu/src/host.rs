@@ -7754,19 +7754,20 @@ impl Host {
     /// Shows `texture`, which is in `state` (a host state) and stays in it,
     /// as frame `frame` (saved if captures are on). `None` if nothing was
     /// shown; else, in diagnostics builds, whether the frame was black.
-    pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+    pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64, trace: crate::present_trace::Trace) -> Option<bool> {
         #[cfg(feature = "diagnostics")]
         crate::draw::poll_draw_window_marker(frame);
         let showing = std::time::Instant::now();
-        let shown = self.present_now(texture, state, frame);
+        let shown = self.present_now(texture, state, frame, trace);
         crate::framelog::add(crate::framelog::T::PresentShowUs, showing.elapsed().as_micros() as u64);
         shown
     }
 
-    fn present_now(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+    fn present_now(&self, texture: &ID3D12Resource, state: u32, frame: u64, trace: crate::present_trace::Trace) -> Option<bool> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
+            trace.skip(frame, "unsupported_format");
             tracing::warn!(format = desc.Format.0, "cannot present this format");
             return None;
         };
@@ -7776,6 +7777,7 @@ impl Host {
             *presenter = match self.presenter(width, height, format) {
                 Ok(p) => Some(p),
                 Err(e) => {
+                    trace.skip(frame, "swapchain_creation_failed");
                     tracing::warn!(error = %e, "no swap chain");
                     return None;
                 }
@@ -7803,6 +7805,7 @@ impl Host {
                     self.log_video_memory("right after the swap chain's buffers were made again");
                 }
                 Err(e) => {
+                    trace.skip(frame, "swapchain_resize_failed");
                     tracing::warn!(error = %e, width, height, "swap chain not resized");
                     return None;
                 }
@@ -7813,6 +7816,7 @@ impl Host {
         unsafe {
             let index = p.swap_chain.GetCurrentBackBufferIndex();
             let Ok(back) = p.swap_chain.GetBuffer::<ID3D12Resource>(index) else {
+                trace.skip(frame, "backbuffer_unavailable");
                 return None;
             };
             // Sent ahead ([`late_free_present`]) unless the frame is to be
@@ -7876,7 +7880,7 @@ impl Host {
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let _ = trace.physical(frame, p.swap_chain.as_raw() as usize, || p.swap_chain.Present(0, DXGI_PRESENT(0)));
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));

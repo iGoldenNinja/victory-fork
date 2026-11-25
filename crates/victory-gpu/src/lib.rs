@@ -50,6 +50,7 @@ mod plaincopy;
 mod primitive;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod profile;
+mod present_trace;
 pub mod query;
 pub mod queue;
 #[cfg(windows)]
