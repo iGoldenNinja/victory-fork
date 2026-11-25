@@ -50,6 +50,7 @@ pub(crate) struct Target {
     pub input_dword: Option<u32>,
     pub extra_dword: Option<u32>,
     pub feed_constant: Option<u32>,
+    pub counter_dword: Option<u32>,
     producer: bool,
     mask: bool,
     rect: [u32; 4],
@@ -58,15 +59,17 @@ pub(crate) struct Target {
 pub(crate) fn target(hash: &str, compute: bool) -> Option<Target> {
     let pass = super::pass::config()?;
     let upstream = super::producer::config();
-    if compute && let Some((mask, list, cb)) = super::producer::mask() && mask.hash == hash {
+    if compute && let Some(cfg) = super::producer::mask() && cfg.pass.hash == hash {
+        let mask = &cfg.pass;
         return Some(Target { table: mask.table, dword: mask.uav, shader: mask.hash.as_str(), writer: true,
-            input_dword: Some(mask.srv), extra_dword: Some(*list), feed_constant: Some(*cb),
-            producer: false, mask: true, rect: mask.rect });
+            input_dword: Some(mask.srv), extra_dword: Some(cfg.list), feed_constant: Some(cfg.constant),
+            counter_dword: cfg.counters, producer: false, mask: true, rect: mask.rect });
     }
     if compute && let Some(cfg) = upstream
         && let Some(shader) = cfg.shaders.iter().find(|h| h.as_str() == hash) {
         return Some(Target { table: cfg.table, dword: cfg.output, shader, writer: true,
-            input_dword: Some(cfg.list), extra_dword: Some(cfg.constant), feed_constant: None, producer: true, mask: false, rect: cfg.rect });
+            input_dword: Some(cfg.list), extra_dword: Some(cfg.constant), feed_constant: None,
+            counter_dword: None, producer: true, mask: false, rect: cfg.rect });
     }
     let (table, dword, shader) = if compute {
         if pass.hash != hash { return None; }
@@ -79,7 +82,7 @@ pub(crate) fn target(hash: &str, compute: bool) -> Option<Target> {
     let extra_dword = upstream.filter(|cfg| compute && cfg.table == table).map(|cfg| cfg.downstream);
     Some(Target { table, dword, shader, writer: compute, input_dword: compute.then_some(pass.srv),
         extra_dword, feed_constant: upstream.filter(|_| extra_dword.is_some()).and_then(|c| c.downstream_constant),
-        producer: false, mask: false, rect: pass.rect })
+        counter_dword: None, producer: false, mask: false, rect: pass.rect })
 }
 
 pub(crate) fn host_index(root_bytes: u32, dword: u32) -> Option<u32> {
@@ -94,6 +97,7 @@ pub(crate) struct Binding {
     pub input: Option<(WatchedSlot, Option<View>)>,
     pub extra: Option<(WatchedSlot, Option<View>)>,
     pub feed_constant: Option<(WatchedSlot, Option<View>)>,
+    pub counters: Option<(WatchedSlot, Option<View>)>,
 }
 
 pub(crate) fn guest_resource(view: &View) -> usize {
@@ -145,6 +149,8 @@ pub(crate) struct Pending {
     frame: u64,
     target: Target,
     output: Option<ID3D12Resource>,
+    list_buffer: Option<(ID3D12Resource, u64, u64)>,
+    counter_buffer: Option<(ID3D12Resource, u64, u64)>,
 }
 
 impl Binding {
@@ -188,12 +194,14 @@ impl Binding {
                 state=tracked.as_ref().map(|(_, s)| s.0), ?view_words, sampled, "descriptor trace binding");
             list.defer_descriptor_event(Event { id: input_id, frame, slot: Some(slot) });
         }
+        let mut list_buffer = None;
         if let Some((slot, view)) = self.extra {
             let resource = slot.resource();
             let extra_id = next_id();
             let sampled = if t.mask {
-                // Observe only the destination list identity here. The downstream writers
-                // capture its contents through their SRV after this dispatch has finished.
+                if t.counter_dword.is_some() {
+                    list_buffer = super::producer::output_range(&slot, view.as_ref());
+                }
                 false
             } else if t.producer {
                 super::producer::sample_slot(list, &slot, view.as_ref(), frame, format!("slot-{id}-constants-before"))
@@ -206,6 +214,15 @@ impl Binding {
             tracing::info!(id=extra_id, frame, role, writer=id, shader=t.shader, dword=t.extra_dword,
                 heap=slot.heap, index=slot.index, native=native(resource.as_ref()), sampled, "descriptor trace binding");
             list.defer_descriptor_event(Event { id: extra_id, frame, slot: Some(slot) });
+        }
+        let mut counter_buffer = None;
+        if let Some((slot, view)) = self.counters {
+            counter_buffer = super::producer::output_range(&slot, view.as_ref());
+            let counter_id = next_id();
+            tracing::info!(id=counter_id, frame, role="counter-target", writer=id, shader=t.shader,
+                dword=t.counter_dword, heap=slot.heap, index=slot.index, native=native(slot.resource().as_ref()),
+                usable=counter_buffer.is_some(), "descriptor trace binding");
+            list.defer_descriptor_event(Event { id: counter_id, frame, slot: Some(slot) });
         }
         if let Some((slot, view)) = self.feed_constant {
             let input_id = next_id();
@@ -222,7 +239,7 @@ impl Binding {
             rt=native(target.as_ref()), sampled, rt_before, "descriptor trace binding");
         list.defer_descriptor_event(Event { id, frame, slot: Some(self.slot) });
         let output = if t.writer { actual } else { target };
-        Some(Pending { id, frame, target: t, output })
+        Some(Pending { id, frame, target: t, output, list_buffer, counter_buffer })
     }
 }
 
@@ -244,6 +261,15 @@ impl Pending {
             else { (D3D12_RESOURCE_STATE_RENDER_TARGET, "rt-after") };
         let sampled = self.output.as_ref().is_some_and(|r| super::pass::sample_native(
             list, r, state, self.frame, format!("slot-{}-{tag}", self.id), self.target.rect));
+        if self.target.counter_dword.is_some() {
+            let copy = |range: Option<(ID3D12Resource, u64, u64)>, name: &str| {
+                range.is_some_and(|(buffer, at, size)| super::pass::sample_buffer(list, &buffer, at, size,
+                    Some(D3D12_RESOURCE_STATE_UNORDERED_ACCESS), self.frame, format!("slot-{}-{name}-after", self.id)))
+            };
+            let list_after = copy(self.list_buffer, "list");
+            let counters_after = copy(self.counter_buffer, "counters");
+            tracing::info!(id=self.id, frame=self.frame, list_after, counters_after, "generator buffer outputs");
+        }
         tracing::info!(id=self.id, frame=self.frame, sampled, "descriptor trace end");
     }
 }

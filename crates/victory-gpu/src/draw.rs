@@ -1102,8 +1102,9 @@ impl State {
                     let input = target.input_dword.and_then(watched);
                     let extra = target.extra_dword.and_then(watched);
                     let feed_constant = target.feed_constant.and_then(watched);
+                    let counters = target.counter_dword.and_then(watched);
                     self.traced_binding = Some(crate::capture::lineage::Binding {
-                        frame, target, slot: heap.watch_slot(index), guest, input, extra, feed_constant,
+                        frame, target, slot: heap.watch_slot(index), guest, input, extra, feed_constant, counters,
                     });
                 }
                 // SAFETY: an open list; `values` covers the parameter.
