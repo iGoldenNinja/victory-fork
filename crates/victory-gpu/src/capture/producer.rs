@@ -55,20 +55,32 @@ pub(super) fn config() -> Option<&'static Config> {
 
 // A producer can classify tiles in a small mask before emitting an indirect list.
 // Use the same crop parser as other dispatch captures, followed by list and CBV offsets.
-fn parse_mask(text: &str) -> Option<(super::pass::Config, u32, u32)> {
+pub(super) struct Mask {
+    pub pass: super::pass::Config,
+    pub list: u32,
+    pub constant: u32,
+    pub counters: Option<u32>,
+}
+
+fn parse_mask(text: &str) -> Option<Mask> {
     let (fields, constant) = text.rsplit_once(',')?;
     let (fields, list) = fields.rsplit_once(',')?;
+    let (list, counters) = match list.split_once(':') {
+        Some((a,b)) => (a, Some(b.trim().parse::<u32>().ok()?)),
+        None => (list, None),
+    };
     let (list, constant) = (list.trim().parse::<u32>().ok()?, constant.trim().parse::<u32>().ok()?);
     let pass = super::pass::parse(fields)?;
     let slots = [pass.srv, pass.uav, list, constant];
     if slots.iter().enumerate().any(|(i, d)| !d.is_multiple_of(8) || slots[..i].contains(d)) {
         return None;
     }
-    Some((pass, list, constant))
+    if counters.is_some_and(|d| !d.is_multiple_of(8) || slots.contains(&d)) { return None; }
+    Some(Mask { pass, list, constant, counters })
 }
 
-pub(super) fn mask() -> Option<&'static (super::pass::Config, u32, u32)> {
-    static MASK: OnceLock<Option<(super::pass::Config, u32, u32)>> = OnceLock::new();
+pub(super) fn mask() -> Option<&'static Mask> {
+    static MASK: OnceLock<Option<Mask>> = OnceLock::new();
     MASK.get_or_init(|| {
         let text = std::env::var("VICTORY_CAPTURE_MASK_PASS").ok()?;
         let selection = parse_mask(&text);
@@ -98,6 +110,18 @@ pub(super) fn sample_slot(list: &HostList, slot: &WatchedSlot, view: Option<&Vie
     super::pass::sample_buffer(list, &current, shadow.offset(address), bytes, None, frame, name)
 }
 
+/// Retain the exact resource and byte range behind a writable shader descriptor.
+pub(super) fn output_range(slot: &WatchedSlot, view: Option<&View>)
+    -> Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u64, u64)> {
+    let view = view?;
+    if !matches!(view, View::Unordered(..) | View::Placed(true, ..)) { return None; }
+    let (shadow, address, bytes) = buffer_copy(view)?;
+    let actual = slot.resource()?;
+    if actual.as_raw() != shadow.buffer.as_raw() || bytes > shadow.left(address) { return None; }
+    let at = shadow.offset_in(address)?;
+    Some((actual, at, bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,8 +141,12 @@ mod tests {
     #[test]
     fn parses_mask_textures_and_distinct_list_and_constant_offsets() {
         let fields = "1234567890abcdef,1,8,40,0,0,20,23";
-        let (mask, list, cb) = parse_mask(&format!("{fields},32,48")).unwrap();
-        assert_eq!((mask.rect, list, cb), ([0,0,20,23], 32, 48));
+        let mask = parse_mask(&format!("{fields},32,48")).unwrap();
+        assert_eq!((mask.pass.rect, mask.list, mask.constant, mask.counters), ([0,0,20,23], 32, 48, None));
+        assert_eq!(parse_mask(&format!("{fields},32:24,48")).unwrap().counters, Some(24));
+        for invalid in ["32:8,48", "32:32,48", "32:48,48", "32:21,48", "32:24:16,48"] {
+            assert!(parse_mask(&format!("{fields},{invalid}")).is_none());
+        }
         assert!(parse_mask(&format!("{fields},32,32")).is_none());
         assert!(parse_mask(&format!("{fields},8,48")).is_none());
         assert!(parse_mask(&format!("{fields},33,48")).is_none());
