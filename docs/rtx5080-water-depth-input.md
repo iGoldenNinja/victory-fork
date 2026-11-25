@@ -1,5 +1,7 @@
 # Why the water transmission shader writes black at the boat helm
 
+**The tile generator dropped work that its own eligibility mask requested.** Reserving one slot per eligible tile restored the missing water in the RTX 5080 boat replay, both at the helm and under throttle. The fix changes tile-list allocation. Both volumetric writers and the final water shader used their original programs. [Matched results and local build instructions](#repairing-the-work-list)
+
 All 495 coordinates from the previously reported isolated water patch turned from colored to exact packed zero again on an RTX 5080. At every one, the water shader's bound depth SRV contained a positive finite float. A separate replay instrumented the shader itself. All 495 sites then reported an exact zero RGB result from the full shading calculation with nonzero final exposure. The zero-depth return and the alternate scene-copy path have distinct signatures. [Earlier measurement](rtx5080-water-frame-trace.md)
 
 ## Depth and the displayed image
@@ -80,3 +82,44 @@ A fifth replay repeated the throttle comparison after three successive helm imag
 | Original 495 coordinates | 495 / 7,425 (6.67%) | 0 / 5,940 |
 
 The moving repeat caught another 41,948 failed-weight observations. Every one had four zero alphas, four positive interpolation factors and four finite positive source depths. None of the 2,432,317 positive-weight controls had four zero alphas. The one moving treatment window covered different positions along the route from the original windows. The whole-crop improvement was modest, visible black marks persisted in the scene, and the original coordinates gave mixed results across the stationary and moving replays. Both additional runs ended deliberately and verified the protected save. The current-frame treatment remains experimental.
+
+## Where the four empty inputs came from
+
+The Series X boat replay used an RTX 5080 on driver 617.14, Windows 11 Pro 25H2 build 26200.9974, and a Ryzen 9 5900X. The two flotation copy-backs were enabled throughout. The water reconstruction and both half-resolution shading programs were stock. Capture build `ed5a44b4e4da299a6f63600712029b4f483c125d` established the indirect group counts and packed output changes. Its probe missed the list-owned constant-buffer upload. Build `d75398599c706d710f638f84f10585632348dd64` captured the actual byte range at both upstream constant descriptors and at the downstream dispatch. The second replay reached the same stationary helm and verified the protected profile after closure.
+
+All **495 original screen coordinates** changed from color to exact black together at scene tick 465. Their four-tap reconstruction read 174 distinct half-resolution texels spanning four adjacent 8 × 8 tiles. Neither volumetric writer received any of those four tiles. Every sampled alpha was already zero before the first writer and stayed zero through the second. In this instance 495 of 550 pixels in a same-row comparison rectangle also turned black, so that rectangle alone is an unreliable control.
+
+Across 123 stationary dispatches, there were **1,423,048** positive-depth changes from color to black in the fixed crop. All had four zero source alphas. For 1,423,045 of them, all four samples lay outside the submitted work lists. The other three straddled a scheduled tile. Across all 3,330 recurring observations at the historical coordinates, all four samples fell outside both lists. Every one of 498,894 previously colored, still-colored samples on a fixed control grid had a nonzero alpha and at least one scheduled source tile. The comparisons join command recording, physical queue submission and completion. The source crop agreed byte for byte between successive stages.
+
+The forward writer received 6,844–7,082 groups per dispatch. It changed 16,947,015 packed texels across the captures, all within its listed tiles. The reverse writer received zero groups in all 123 stationary dispatches. Of 853,692 front-list entries, 6,403 repeated a coordinate already in that dispatch. On a separate stock replay, 3,198 of 6,318 positions containing duplicates retained the preceding dispatch's word at the same index. For positions containing a unique coordinate, 8,668 of 417,678 did so. These are repeated measurements at one scene.
+
+## Repairing the work list
+
+Capture revision `13b5c650ffba17f91eca9bd5f01a5413f3460685` measures the actual GPU inputs and outputs of the tile generator before following the same list into both writers. The shader's eligibility input at dword 8 and its emitted mask at dword 40 agreed on every measured tile. Its coordinate list at dword 32 lost eligible tiles. During stock stationary phases, 785,341 of 785,343 newly black samples read four inputs that were all eligible and absent from the list. At the other two samples, at least one eligible input was absent. Every newly black sample under throttle read four eligible, missing inputs.
+
+The intervention kept tile classification, packed coordinates, front/back counters, partition choice and bounds checking. Each eligible tile reserved one slot from its partition and wrote its coordinate there. The outgoing list then exactly matched the incoming eligibility mask throughout the measured treatment phases. The downstream passes shaded the newly scheduled tiles. This localizes the failure to the original compaction path on this renderer. The particular wave instruction or lowering rule responsible is still open.
+
+The same title process alternated the stock reservation and the per-tile reservation every 32 scene ticks. Both used the same Series X checkpoint, cache, camera at the stationary helm and two water copy-backs. Each result includes only ticks 4 through 27 of its phase, with a verified physical queue submission and matching scene constants. The stationary sample covers eight periods per arm. The throttle sample covers two per arm as the boat accelerated toward the bridge, with visible wakes. The moving comparisons cover different positions on that route.
+
+| Scene and allocation | Dispatches | Eligible tile entries omitted | Duplicate listed entries | Exact black / positive-depth samples in the crop | Exact black at the original 495 coordinates |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Stationary, stock | 66 | 39,433 | 3,576 | 1,438,161 / 35,109,060 (4.10%) | 990 / 32,670 |
+| Stationary, per tile | 69 | 0 | 0 | 0 / 36,704,445 | 0 / 34,155 |
+| Under throttle, stock | 29 | 9,191 | 4,004 | 375,532 / 14,913,877 (2.52%) | 990 / 14,355 |
+| Under throttle, per tile | 27 | 0 | 0 | 0 / 13,586,029 | 0 / 13,365 |
+
+The 495 original sites failed together on stock in both scene segments. In the fixed open-water strip, stock yielded 48,756 black samples while stationary and 11,938 under throttle. Treatment yielded zero across 8,942,400 stationary and 3,499,200 moving strip samples. All 706,308 eligible treatment entries appeared once. Across the measured helm and throttle phases, the reverse writer received zero groups. Its operation with a populated back partition remains an independent test.
+
+The visible rectangles also returned when the stock path resumed. Thirty stationary window images fell wholly between two completed GPU readbacks in the same phase interior. Two other images lacked a qualifying bracket. In the preselected open-water area left of the boat, the median count of dark pixels in horizontal runs at least four pixels wide was 128 on stock and zero with the repair, using half the same-row median luminance. At the 65% threshold the medians were 692 and zero. All 15 treatment images had zero at both thresholds. The smaller right-side area had median zero in both arms. Window captures bracket a phase in time and carry no individual presentation stamp.
+
+### Build the marker-free experiment locally
+
+The source-only tool reads an existing PC-translated VIctory cache entry and produces a new entry for a separate local cache. It checks the original cache and shader hashes before rewriting and checks both resulting hashes after Microsoft DXIL validation. It preserves the original VIctory binding metadata. The tested x64 DXC build reported `1.9.2609.5 (01b62ad47)`. A second local invocation of the public source regenerated the tested marker-free entry byte for byte. [Water tile repair source](../tools/water-tile-append.py)
+
+On the tested renderer the entry for shader `1aa247ed3653b616` is `shaders/2c/948ee4bda28bdad3eb3a1c6fcde0a3af6f6e2adb2ecbe9b6b0ea366afa03ac` relative to the cache root. Supply that entry from the control cache and use the same relative name in a separate test cache. The tool accepts only stock entry SHA-256 `61dafa05d260cc1068b322b540b967cedd254755bcf9306e47e3d8b95cda7141`. The marker-free result is `96af8bbb212e0fb37f03c1a7bff99ae7b44766fb8eccc25403aa2e9d9482fee9`.
+
+```text
+py -3 tools/water-tile-append.py STOCK_ENTRY NEW_ENTRY --dxc-dir DXC_X64_FOLDER
+```
+
+Nine focused capture tests passed. The full GPU-library run had 201 passes, seven skips and the previously observed WARP draw-budget ordering assertion. An independent upstream change explains that either of the two test groups may win the reservation. [WARP test correction](https://github.com/fxceless/victory-fork/pull/1110)
