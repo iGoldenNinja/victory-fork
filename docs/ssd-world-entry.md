@@ -11,3 +11,9 @@ The observed checkpoint was the opening credits. Controllable gameplay and the d
 [VIctory issue #71](https://github.com/Marvisak/VIctory/issues/71) · [Tester discussion](https://github.com/Marvisak/VIctory/issues/49)
 
 AI-assisted testing and analysis with OpenAI Codex.
+
+## Controlled gameplay on the pinned build
+
+In the prison room, recorded controller input turned the camera both ways and changed the distance to the desk and lamp during forward and backward movement. Substantial character, room and lighting defects were visible. The five-minute run, with four separate marked movement inputs, recorded 737 displayed application frames over 300.016 s. It averaged 2.453 FPS, with 740.854 ms P99 frame time and a worst interval of 981.953 ms. The mean measured GPU busy time was 147.23 ms per displayed interval. The exact-PID trace showed no generated frames. Title-process loopback contained real audio during gameplay. A passing real-time animation and audio-sync test is still pending.
+
+The frame-time result covers the pinned SSD build. Separately, the earlier wave64 evidence covers four opening-sequence pipeline rejections.
