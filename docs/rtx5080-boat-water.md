@@ -16,10 +16,14 @@ With water writeback disabled, water rose above the deck while both characters w
 
 ## Two-plane writeback
 
-The treatment copied only the 64 × 64 `R32G32_FLOAT` (format 16) and 128 × 128 `R16G16_UINT` (format 36) planes back to guest memory. Logs confirmed at least 2,048 and 512 completed full-plane writes respectively. The counters log powers of two. At the corresponding helm shot (050), water sat around the hull and the bank and trees were visible behind the helm. In the aft-camera HUD view the stern, both outboards and occupants stayed above the water through samples 058 and 059. The aircraft-follow objective remained active. The first throttle input came after both observations. Black rectangular patches remained visible on the surface.
+The treatment copied only the 64 × 64 `R32G32_FLOAT` (format 16) and 128 × 128 `R16G16_UINT` (format 36) planes back to guest memory. By the end of the session, logs confirmed at least 4,096 and 2,048 completed full-plane writes respectively. The counters log powers of two. At the corresponding helm shot (050), water sat around the hull and the bank and trees were visible behind the helm. In the aft-camera HUD view the stern, both outboards and occupants stayed above the water through samples 058 and 059. The aircraft-follow objective remained active. The first throttle input came after both observations. Dark rectangular patches remained visible on the surface.
 
 After RT, a wake appeared and widened as the boat moved forward (061–062). A 4.2-second starboard input while under throttle changed the bow heading relative to the fixed bridge (063), with the boat still afloat. The HUD then advanced to the package-collection objective and showed a marker on the water ahead (065).
 
-Later, the boat struck the mangroves (071). The player entered the water and the HUD prompted a return to the boat (072).
+Later, the boat struck the mangroves (071). The player entered the water and the HUD prompted a return to the boat (072). Both occupants were back aboard with the package objective active in sample 107. Dialogue referred to a second drop and the mission history subsequently listed a plural package-collection objective (157). Actual pickup remained unverified. After deliberate exit, the story container in each writable profile still matched its original v2 payloads and manifest. All nine files in the protected save copy retained their verified hashes.
 
 This control and treatment establish that the two outputs together restored flotation through the observed mission handoff on this 5080. The individual contribution of each output remains untested. The control lost its passenger before the treatment's driving interval, so there is no matched driving FPS comparison.
+
+## First minute under throttle in the treatment
+
+Starting with the first display after RT, PresentMon recorded 135 displayed application frames on the title's swap chain. The 134 distinct display intervals spanned 60.216 seconds, averaging 2.225 FPS. The nearest-rank P99 interval was 1,733.346 ms and the longest interval was 1,813.033 ms. This window includes steering and the transition from following the aircraft to the package objective.
