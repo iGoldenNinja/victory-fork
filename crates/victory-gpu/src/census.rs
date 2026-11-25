@@ -193,7 +193,10 @@ pub(crate) fn compared(start: u64, pieces: u64) {
     }
 }
 
-/// `bytes` of the copy at `start` were fetched back from the card, in one piece.
+/// One span of `bytes` from the card copy at `start` was received for merging.
+/// For an in-flight slot this counts its usable span, after excluding any bytes
+/// already received from a newer fetch. Slot padding and bytes written back to
+/// title memory are separate from this count.
 pub(crate) fn fetched(start: u64, bytes: u64) {
     if !on() {
         return;

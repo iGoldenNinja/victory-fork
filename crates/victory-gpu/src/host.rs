@@ -4039,7 +4039,9 @@ impl Host {
             // copy into it ran in the plan's flight, which the card has run.
             let gpu = unsafe { std::slice::from_raw_parts(*at as *const u8, hi - lo) };
             written += shadow.card_merge_relay(*lo, gpu, *after, &mut title);
-            bytes += (hi - lo) as u64;
+            let landed = gpu.len() as u64;
+            bytes += landed;
+            crate::census::fetched(shadow.title_start(), landed);
         }
         for plan in plans {
             for r in &plan.ranges {
