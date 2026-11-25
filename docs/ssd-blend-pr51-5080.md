@@ -1,6 +1,6 @@
 # NVIDIA integer render target blend fix on the RTX 5080
 
-Tested Windows 11 Pro build 26200, Ryzen 9 5900X, 32 GB RAM and GeForce RTX 5080 16 GB, driver 617.14. The candidate adds the integer-target blend change from NVIDIA PR 51 (`d82acefa8e3005a4293f327b4099b6c547602d9e`) to the earlier diagnostic PR 688 build (`7e7bb180625298dd418cb7ce71923140363ff02f`). The saved Series X profile, SATA SSD package, warmed cache, `VICTORY_RELAY=1`, `VICTORY_CARD_INLINE_STAGE=1` and DRED matched the previous staging-on run. Both builds included the same local archive and replay helpers. These were separate game launches.
+Tested Windows 11 Pro build 26200, Ryzen 9 5900X, 32 GB RAM and GeForce RTX 5080 16 GB, driver 617.14. The candidate adds the integer-target blend change from NVIDIA PR 51 (`d82acefa8e3005a4293f327b4099b6c547602d9e`) to the earlier diagnostic PR 688 build (`7e7bb180625298dd418cb7ce71923140363ff02f`). The saved Series X profile, SATA SSD package, `VICTORY_RELAY=1`, `VICTORY_CARD_INLINE_STAGE=1` and DRED matched the previous staging-on run. Each executable had its own shader-cache key, and both logged zero hits during startup. Both builds included the same local archive and replay helpers. These were separate game launches.
 
 ## Pipeline and visibility
 
