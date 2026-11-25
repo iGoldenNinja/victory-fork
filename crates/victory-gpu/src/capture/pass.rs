@@ -69,7 +69,10 @@ fn binding(list: &HostList, view: View, output: bool, rect: [u32; 4]) -> Option<
     let texture = Texture::checked(copy, state, rect)?;
     if let Some(words) = desc {
         let dim = if output { D3D12_UAV_DIMENSION_TEXTURE2D.0 } else { D3D12_SRV_DIMENSION_TEXTURE2D.0 };
-        if words[1] != dim as u32 || crate::resource::pc_format(words[0]) != texture.format.0 as u32 { return None; }
+        let view_format = crate::resource::pc_format(words[0]) as i32;
+        let depth_srv = !output && matches!(texture.format, DXGI_FORMAT_R32_TYPELESS | DXGI_FORMAT_D32_FLOAT)
+            && view_format == DXGI_FORMAT_R32_FLOAT.0 && words[4] == 0 && words[6] == 0;
+        if words[1] != dim as u32 || (!depth_srv && view_format != texture.format.0) { return None; }
     }
     Some(texture)
 }
@@ -83,7 +86,8 @@ impl Texture {
             || d.DepthOrArraySize != 1 || d.SampleDesc.Count != 1
             || u64::from(x + w) > d.Width || y + h > d.Height { return None; }
         let bpp = match d.Format {
-            DXGI_FORMAT_R11G11B10_FLOAT | DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R32_FLOAT => 4,
+            DXGI_FORMAT_R11G11B10_FLOAT | DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R32_FLOAT
+            | DXGI_FORMAT_R32_TYPELESS | DXGI_FORMAT_D32_FLOAT => 4,
             DXGI_FORMAT_R16G16B16A16_FLOAT => 8,
             _ => return None,
         };
@@ -98,39 +102,84 @@ pub(crate) struct Region {
     format: DXGI_FORMAT,
     rect: [u32; 4],
     row: u32,
-    pitch: u32,
+    footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+    area: Option<D3D12_BOX>,
+    start: usize,
 }
 
 impl Region {
     fn new(t: &Texture, frame: u64, name: impl Into<String>, rect: [u32; 4]) -> Option<Self> {
-        let row = rect[2] * t.bpp;
-        let pitch = row.next_multiple_of(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
-        let back = host()?.read_back_buffer(u64::from(pitch) * u64::from(rect[3]))?;
-        Some(Self { back, frame, name: name.into(), format: t.format, rect, row, pitch })
+        Self::allocate(&t.copy.texture, t.bpp, frame, name.into(), rect)
+    }
+
+    fn allocate(resource: &ID3D12Resource, bpp: u32, frame: u64, name: String, rect: [u32; 4]) -> Option<Self> {
+        let host = host()?;
+        // SAFETY: the caller holds the resource and it has a single sample, mip and slice.
+        let desc = unsafe { resource.GetDesc() };
+        let [x, y, w, h] = rect;
+        let row = w.checked_mul(bpp)?;
+        let whole = desc.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+        let (footprint, area, start, size) = if whole {
+            // D3D12 requires the whole depth subresource with no source box. The
+            // device supplies its copy format and row pitch; crop only after the fence.
+            let mut layout = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+            let (mut rows, mut bytes, mut size) = (0u32, 0u64, 0u64);
+            unsafe { host.device.GetCopyableFootprints(&desc, 0, 1, 0, Some(&mut layout),
+                Some(&mut rows), Some(&mut bytes), Some(&mut size)) };
+            if rows != desc.Height || bytes != desc.Width.checked_mul(u64::from(bpp))?
+                || size == 0 || size == u64::MAX { return None; }
+            let start = layout.Offset + u64::from(y) * u64::from(layout.Footprint.RowPitch) + u64::from(x) * u64::from(bpp);
+            (layout, None, start, size)
+        } else {
+            let pitch = row.checked_next_multiple_of(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT)?;
+            let layout = D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Offset: 0, Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                Format: desc.Format, Width: w, Height: h, Depth: 1, RowPitch: pitch,
+            }};
+            let area = D3D12_BOX { left: x, top: y, front: 0, right: x + w, bottom: y + h, back: 1 };
+            (layout, Some(area), 0, u64::from(pitch) * u64::from(h))
+        };
+        let end = start + u64::from(h - 1) * u64::from(footprint.Footprint.RowPitch) + u64::from(row);
+        if end > size { return None; }
+        let back = host.read_back_buffer(size)?;
+        Some(Self { back, frame, name, format: desc.Format, rect, row, footprint, area, start: start.try_into().ok()? })
     }
 
     fn record(&self, list: &HostList, t: &Texture) {
-        let [left, top, width, height] = self.rect;
-        let area = D3D12_BOX { left, top, front: 0, right: left + width, bottom: top + height, back: 1 };
+        self.record_resource(list, &t.copy.texture, t.state);
+    }
+
+    fn record_resource(&self, list: &HostList, resource: &ID3D12Resource, state: D3D12_RESOURCE_STATES) {
         let src = D3D12_RESOURCE_STATE_COPY_SOURCE;
-        // SAFETY: the state is from this list, both resources remain alive through its fence,
-        // and the single-sample, single-subresource box and pitched buffer were checked above.
+        // SAFETY: the resource's tracked state is restored on the same list. The
+        // footprint is valid for the crop or, for depth, the full subresource.
         unsafe {
-            list.list.ResourceBarrier(&[transition(&t.copy.texture, t.state, src)]);
+            list.list.ResourceBarrier(&[transition(resource, state, src)]);
             let from = D3D12_TEXTURE_COPY_LOCATION {
-                pResource: std::mem::transmute_copy(&t.copy.texture), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                pResource: std::mem::transmute_copy(resource), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
                 Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
             };
             let to = D3D12_TEXTURE_COPY_LOCATION {
                 pResource: std::mem::transmute_copy(&self.back), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
-                    Offset: 0, Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
-                        Format: self.format, Width: width, Height: height, Depth: 1, RowPitch: self.pitch,
-                    },
-                }},
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: self.footprint },
             };
-            list.list.CopyTextureRegion(&to, 0, 0, 0, &from, Some(&area));
-            list.list.ResourceBarrier(&[transition(&t.copy.texture, src, t.state)]);
+            list.list.CopyTextureRegion(&to, 0, 0, 0, &from, self.area.as_ref().map(std::ptr::from_ref));
+            list.list.ResourceBarrier(&[transition(resource, src, state)]);
+        }
+    }
+
+    fn write_rows(&self, out: &mut impl Write) -> std::io::Result<()> {
+        let pitch = self.footprint.Footprint.RowPitch as usize;
+        let span = (self.rect[3] - 1) as usize * pitch + self.row as usize;
+        let mut ptr = std::ptr::null_mut();
+        // SAFETY: the submission completed before reporting. The mapped range
+        // includes the crop's final row and the inter-row padding.
+        unsafe {
+            self.back.Map(0, Some(&D3D12_RANGE { Begin: self.start, End: self.start + span }), Some(&mut ptr))
+                .map_err(std::io::Error::other)?;
+            let bytes = std::slice::from_raw_parts(ptr.cast::<u8>().add(self.start), span);
+            let result = bytes.chunks(pitch).try_for_each(|line| out.write_all(&line[..self.row as usize]));
+            self.back.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
+            result
         }
     }
 
@@ -140,17 +189,7 @@ impl Region {
         let path = dir.join(format!("frame-{}-pass-{}-x{x}-y{y}-{w}x{h}-f{}.bin", self.frame, self.name, self.format.0));
         let write = (|| -> std::io::Result<()> {
             let mut file = BufWriter::new(std::fs::File::create(path)?);
-            let len = (h - 1) as usize * self.pitch as usize + self.row as usize;
-            let mut ptr = std::ptr::null_mut();
-            // SAFETY: report runs only after list completion. Row padding is excluded from the file.
-            unsafe {
-                self.back.Map(0, Some(&D3D12_RANGE { Begin: 0, End: len }), Some(&mut ptr))
-                    .map_err(std::io::Error::other)?;
-                let bytes = std::slice::from_raw_parts(ptr.cast::<u8>(), len);
-                let result = bytes.chunks(self.pitch as usize).try_for_each(|line| file.write_all(&line[..self.row as usize]));
-                self.back.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
-                result?;
-            }
+            self.write_rows(&mut file)?;
             file.flush()
         })();
         if let Err(error) = write { tracing::warn!(%error, frame = self.frame, "compute pass region was not saved"); }
@@ -199,6 +238,52 @@ impl Pending {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires a native D3D12 device"]
+    fn depth_readback_preserves_texel_bits_in_offset_crop() {
+        use windows::Win32::{Foundation::RECT, Graphics::Dxgi::*};
+        let host = host().expect("D3D12 device");
+        let adapter = unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+            factory.EnumAdapterByLuid::<IDXGIAdapter1>(host.device.GetAdapterLuid()).unwrap().GetDesc1().unwrap()
+        };
+        println!("depth probe adapter: {}", String::from_utf16_lossy(&adapter.Description).trim_end_matches(char::from(0)));
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 97, Height: 41, MipLevels: 1,
+            DepthOrArraySize: 1, Format: DXGI_FORMAT_R32_TYPELESS, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, ..Default::default()
+        };
+        let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, CreationNodeMask: 1,
+            VisibleNodeMask: 1, ..Default::default() };
+        let write = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+        let read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        let mut texture: Option<ID3D12Resource> = None;
+        unsafe { host.device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, write, None, &mut texture).unwrap() };
+        let texture = texture.unwrap();
+        let dsv_desc = D3D12_DEPTH_STENCIL_VIEW_DESC { Format: DXGI_FORMAT_D32_FLOAT,
+            ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D, ..Default::default() };
+        let dsv = host.dsv(&texture, Some(&dsv_desc));
+        let rect = RECT { left: 16, top: 12, right: 43, bottom: 20 };
+        let region = Region::allocate(&texture, 4, 0, String::new(), [13, 9, 39, 15]).unwrap();
+        assert!(region.area.is_none());
+        let list = host.new_list().unwrap();
+        unsafe {
+            list.list.ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.375, 0, None);
+            list.list.ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.0, 0, Some(&[rect]));
+            list.list.ResourceBarrier(&[transition(&texture, write, read)]);
+        }
+        region.record_resource(&list, &texture, read);
+        list.close();
+        host.execute(&[&list]);
+        let mut bytes = Vec::new();
+        region.write_rows(&mut bytes).unwrap();
+        let values: Vec<_> = bytes.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+        let expected: Vec<_> = (9..24).flat_map(|y| (13..52).map(move |x| {
+            if (16..43).contains(&x) && (12..20).contains(&y) { 0 } else { 0.375f32.to_bits() }
+        })).collect();
+        assert_eq!(values, expected);
+    }
 
     #[test]
     fn pass_region_checks_coordinates_and_limits() {

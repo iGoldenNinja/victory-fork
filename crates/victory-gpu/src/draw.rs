@@ -1088,11 +1088,17 @@ impl State {
                     && let Some(&Root::Table(base)) = self.roots_ref(compute).get(usize::from(target.table))
                     && let Some(heap) = self.heap_of(base).and_then(|h| h.host())
                 {
-                    let guest = base.checked_add(u64::from(target.dword) * 4)
+                    let view_at = |dword: u32| base.checked_add(u64::from(dword) * 4)
                         .filter(|&at| self.heap_of(at).is_some() && crate::texture::committed(at as *const u8, 12))
-                        .and_then(crate::descriptor::view)
-                        .as_ref().map_or(0, crate::capture::lineage::guest_resource);
-                    self.traced_binding = Some(crate::capture::lineage::Binding { frame, target, slot: heap.watch_slot(index), guest });
+                        .and_then(crate::descriptor::view);
+                    let guest = view_at(target.dword).as_ref().map_or(0, crate::capture::lineage::guest_resource);
+                    let input = target.input_dword.and_then(|dword| {
+                        let index = crate::capture::lineage::host_index(values[u.index as usize], dword)?;
+                        Some((heap.watch_slot(index), view_at(dword)))
+                    });
+                    self.traced_binding = Some(crate::capture::lineage::Binding {
+                        frame, target, slot: heap.watch_slot(index), guest, input,
+                    });
                 }
                 // SAFETY: an open list; `values` covers the parameter.
                 unsafe {

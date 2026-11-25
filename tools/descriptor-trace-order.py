@@ -38,10 +38,10 @@ def timeline(lines):
         bound = int(entry["native"])
         # Copy markers retain the resource itself. Bindings retain a heap slot
         # whose contents may change between recording and submission.
-        actual = native if role in ("reader", "writer") else bound
+        actual = native if role in ("compute-input", "reader", "writer") else bound
         texture = resources.setdefault(actual, len(resources) + 1) if actual else None
         last_write = writes.get(texture) if role in ("reader", "target-preview") else None
-        stable = bound == actual if role in ("reader", "writer") else None
+        stable = bound == actual if role in ("compute-input", "reader", "writer") else None
         rows.append((int(entry["frame"]), fence, position, ident, role, texture, stable, last_write, entry.get("shader")))
         if role == "writer" and texture is not None:
             writes[texture] = ident

@@ -47,6 +47,7 @@ pub(crate) struct Target {
     pub dword: u32,
     shader: &'static str,
     writer: bool,
+    pub input_dword: Option<u32>,
     rect: [u32; 4],
 }
 
@@ -60,7 +61,7 @@ pub(crate) fn target(hash: &str, compute: bool) -> Option<Target> {
         let name = config.hashes.iter().find(|h| h.as_str() == hash)?;
         (config.table, config.dword, name.as_str())
     };
-    Some(Target { table, dword, shader, writer: compute, rect: pass.rect })
+    Some(Target { table, dword, shader, writer: compute, input_dword: compute.then_some(pass.srv), rect: pass.rect })
 }
 
 pub(crate) fn host_index(root_bytes: u32, dword: u32) -> Option<u32> {
@@ -72,6 +73,7 @@ pub(crate) struct Binding {
     pub target: Target,
     pub slot: WatchedSlot,
     pub guest: usize,
+    pub input: Option<(WatchedSlot, Option<View>)>,
 }
 
 pub(crate) fn guest_resource(view: &View) -> usize {
@@ -150,6 +152,20 @@ impl Binding {
         let sample = |native: &ID3D12Resource, state, tag: &str| {
             super::pass::sample_native(list, native, state, frame, format!("slot-{id}-{tag}"), t.rect)
         };
+        if let Some((slot, view)) = self.input {
+            let input = slot.resource();
+            let input_id = next_id();
+            let guest = view.as_ref().map_or(0, guest_resource);
+            let expected = (guest != 0).then(|| crate::resource::host_made(guest as This)).flatten();
+            let tracked = input.as_ref().and_then(|r| list.tracked_texture_state(r));
+            let sampled = input.as_ref().is_some_and(|r| super::pass::sample_native(list, r,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, frame, format!("slot-{id}-input-before"), t.rect));
+            let view_words = view.as_ref().and_then(|v| match v { View::Shader(_, words) => *words, _ => None });
+            tracing::info!(id=input_id, frame, role="compute-input", writer=id, shader=t.shader, dword=t.input_dword,
+                heap=slot.heap, index=slot.index, guest, expected=native(expected), native=native(input.as_ref()),
+                state=tracked.as_ref().map(|(_, s)| s.0), ?view_words, sampled, "descriptor trace binding");
+            list.defer_descriptor_event(Event { id: input_id, frame, slot: Some(slot) });
+        }
         let sampled = actual.as_ref().is_some_and(|r| sample(r, source_state, "bound-before"));
         let rt_before = target.as_ref().is_some_and(|r| sample(r, D3D12_RESOURCE_STATE_RENDER_TARGET, "rt-before"));
         tracing::info!(id, frame, role, shader=t.shader, heap=self.slot.heap, index=self.slot.index,
