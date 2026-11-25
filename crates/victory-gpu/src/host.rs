@@ -7689,6 +7689,8 @@ impl Host {
     /// as frame `frame` (saved if captures are on). `None` if nothing was
     /// shown; else, in diagnostics builds, whether the frame was black.
     pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+        #[cfg(feature = "diagnostics")]
+        crate::draw::poll_draw_window_marker(frame);
         let showing = std::time::Instant::now();
         let shown = self.present_now(texture, state, frame);
         crate::framelog::add(crate::framelog::T::PresentShowUs, showing.elapsed().as_micros() as u64);

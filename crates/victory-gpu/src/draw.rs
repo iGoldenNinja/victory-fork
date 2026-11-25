@@ -187,7 +187,33 @@ const WINDOW_MOST: u64 = 64;
 /// run with windows was announced that way seconds ahead.
 fn windows() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1")) && !crate::drvwatch::tripped()
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1")) || crate::drvwatch::tripped() {
+        return false;
+    }
+    #[cfg(feature = "diagnostics")]
+    if draw_window_marker().is_some() {
+        return DRAW_WINDOW_PROBE.load(Ordering::Relaxed);
+    }
+    true
+}
+
+#[cfg(feature = "diagnostics")]
+static DRAW_WINDOW_PROBE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(feature = "diagnostics")]
+fn draw_window_marker() -> Option<&'static std::path::Path> {
+    static MARKER: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    MARKER.get_or_init(|| std::env::var_os("VICTORY_DRAW_WINDOW_FILE").map(std::path::PathBuf::from)).as_deref()
+}
+
+/// Poll once per present so a diagnostic can compare draw windows at a fixed camera.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn poll_draw_window_marker(frame: u64) {
+    let Some(marker) = draw_window_marker() else { return };
+    let enabled = marker.is_file();
+    if DRAW_WINDOW_PROBE.swap(enabled, Ordering::Relaxed) != enabled {
+        tracing::info!(frame, enabled, "indirect draw window marker changed");
+    }
 }
 
 /// What one title list has set, and what its host list was last given.
