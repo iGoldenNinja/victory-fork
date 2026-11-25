@@ -21,6 +21,9 @@ use super::xasync::{E_INVALIDARG, E_NOTIMPL};
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleExport, HleModule};
 
+#[cfg(windows)]
+pub(super) mod window_buttons;
+
 /// The documented errors.
 pub const DEVICE_DISCONNECTED: HRESULT = 0x838A_0001_u32 as i32;
 pub const DEVICE_NOT_FOUND: HRESULT = 0x838A_0002_u32 as i32;
@@ -111,6 +114,9 @@ trait Source: Send {
     fn pad(&mut self, slot: usize) -> Option<PadState>;
     /// Keys held down; none while the title's window lacks focus.
     fn keys(&mut self) -> Vec<KeyState>;
+    fn stand_in_buttons(&mut self, sampled: u32, _connected: bool) -> u32 {
+        sampled
+    }
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
 }
@@ -401,12 +407,15 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, keys) = {
+        let (pads, keys, keyboard_pad) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            (pads, source.keys())
+            let keys = source.keys();
+            let mut keyboard_pad = fallback(&keys);
+            keyboard_pad.buttons = source.stand_in_buttons(keyboard_pad.buttons, pads.iter().all(Option::is_none));
+            (pads, keys, keyboard_pad)
         };
-        let events = self.state().poll(&self.devices, pads, keys);
+        let events = self.state().poll(&self.devices, pads, keys, keyboard_pad);
         self.deliver(events);
     }
 
@@ -451,6 +460,7 @@ impl State {
         devices: &[Device; DEVICES],
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
+        keyboard_pad: PadState,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
@@ -458,7 +468,7 @@ impl State {
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
+        let fallback = (!any_pad).then_some(Value::Pad(keyboard_pad));
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
@@ -1013,10 +1023,13 @@ extern "system" fn key_state(this: *const Reading, count: u32, out: *mut KeyStat
     n as u32
 }
 extern "system" fn gamepad_state(this: *const Reading, out: *mut PadState) -> bool {
-    match &reading(this).value {
+    let r = reading(this);
+    match &r.value {
         Value::Pad(state) if !out.is_null() => {
             // SAFETY: checked non-null.
             unsafe { out.write(*state) };
+            #[cfg(windows)]
+            window_buttons::delivered(r, state.buttons);
             true
         }
         _ => false,
@@ -1133,6 +1146,10 @@ mod host {
     }
 
     impl Source for Host {
+        fn stand_in_buttons(&mut self, sampled: u32, connected: bool) -> u32 {
+            window_buttons::sample(sampled, connected)
+        }
+
         fn pad(&mut self, slot: usize) -> Option<PadState> {
             if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
                 return None;
