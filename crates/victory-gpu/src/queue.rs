@@ -1068,6 +1068,8 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
     }
     #[cfg(windows)]
     crate::framelog::add(crate::framelog::T::PresentLineUs, presenting.elapsed().as_micros() as u64);
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::capture::poll_trigger(FRAMES.load(Ordering::Relaxed) + 1);
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     #[cfg(windows)]
     if sent_behind && PRESENTS_BEHIND.load(Ordering::Relaxed).is_multiple_of(512) {

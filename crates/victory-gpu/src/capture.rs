@@ -2,11 +2,30 @@
 //! with `VICTORY_CAPTURE=<folder>`, every frame whose number is a power of
 //! two (the frames the log reports) is saved as `frame-<n>.png`, at half
 //! size. Only in builds with diagnostics.
+//!
+//! To capture a scene reached through live input, set `VICTORY_CAPTURE_TRIGGER=1`
+//! and point `VICTORY_CAPTURE` at an existing output directory. Publish a text
+//! file named `capture-next` there by renaming a complete temporary file. With
+//! the contents `ops`, the next selected frame produces the existing operation
+//! trace, a presented PNG, and a TSV inventory of output bindings. To inspect
+//! later frames in the same process, write `targets` followed by up to eight
+//! space-separated hexadecimal resource IDs from that inventory. Selected
+//! targets found again are saved by the existing end-of-frame texture reader.
+//! Check the TSV for their size and format on each new frame. The operation
+//! trace uses CPU recording order; use submission records when following lists.
+//! In trigger mode automatic power-of-two PNGs are skipped. Explicit frame and
+//! world selectors still work. Omit `VICTORY_DUMP_TARGETS` for selective readback.
 
 use std::path::PathBuf;
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
+
+mod trigger;
+
+pub(crate) fn poll_trigger(presenting: u64) {
+    trigger::poll(presenting);
+}
 
 /// The folder frames go to, if capturing.
 pub(crate) fn folder() -> Option<&'static PathBuf> {
@@ -19,6 +38,7 @@ pub(crate) fn folder() -> Option<&'static PathBuf> {
 /// Frames listed in `VICTORY_CAPTURE_FRAMES` (comma-separated): saved
 /// too, and their draws traced at debug level.
 pub(crate) fn listed(n: u64) -> bool {
+    if trigger::listed(n) { return true; }
     static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
     let named = LIST
         .get_or_init(|| {
@@ -168,7 +188,7 @@ pub(crate) fn wanted(n: u64) -> bool {
     // run, so single frames cannot be compared between runs).
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(world_every());
-    folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world)
+    folder().is_some() && ((!trigger::enabled() && n.is_power_of_two()) || listed(n) || before_world || in_world)
 }
 
 /// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.
@@ -362,7 +382,12 @@ fn dump_on() -> bool {
 
 /// Notes a title texture the frame being built renders to or writes.
 pub(crate) fn note_target(resource: crate::object::This) {
-    if resource.is_null() || !dump_on() || !listed(crate::queue::presented() + 1) {
+    if resource.is_null() { return; }
+    let frame = crate::queue::presented() + 1;
+    if trigger::listed(frame) {
+        trigger::note(frame, resource);
+    }
+    if !dump_on() || !listed(frame) {
         return;
     }
     let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
@@ -376,7 +401,13 @@ pub(crate) fn note_target(resource: crate::object::This) {
 /// At the present of frame `frame`: saves the noted targets.
 pub(crate) fn dump_targets(frame: u64) {
     use std::sync::atomic::Ordering::Relaxed;
-    let targets = std::mem::take(&mut *TARGETS.lock().unwrap_or_else(|e| e.into_inner()));
+    let selected = trigger::finish(frame);
+    let mut targets = std::mem::take(&mut *TARGETS.lock().unwrap_or_else(|e| e.into_inner()));
+    for (id, copy) in selected {
+        if !targets.iter().any(|(resource, texture)| *resource == id && std::sync::Arc::ptr_eq(texture, &copy)) {
+            targets.push((id, copy));
+        }
+    }
     let Some(host) = crate::host::host() else { return };
     for (i, (resource, copy)) in targets.iter().enumerate() {
         let texture = &copy.texture;
