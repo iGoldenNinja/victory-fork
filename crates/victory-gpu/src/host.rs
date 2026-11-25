@@ -4021,6 +4021,7 @@ impl Host {
                 },
                 ..Default::default()
             })?;
+            tracing::info!(wide=card_hash_wide(), "host buffer comparison pipeline created");
             Ok(CardWork {
                 sync: vec![list()?],
                 check: vec![list()?],
