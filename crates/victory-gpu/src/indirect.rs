@@ -548,16 +548,33 @@ fn record_clamp_with(
 }
 
 #[cfg(feature = "diagnostics")]
+fn trace_target() -> Option<&'static str> {
+    static HASH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    HASH.get_or_init(|| std::env::var("VICTORY_TRACE_INDIRECT").ok()).as_deref()
+}
+
+#[cfg(feature = "diagnostics")]
 pub(crate) fn trace_hash(hash: &str) -> Option<u64> {
     use std::sync::atomic::{AtomicU64, Ordering};
-    static HASH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-    let selected = HASH.get_or_init(|| std::env::var("VICTORY_TRACE_INDIRECT").ok());
-    if selected.as_deref() != Some(hash) {
+    if trace_target() != Some(hash) {
         return None;
     }
     let sample = SEQUENCE.fetch_add(1, Ordering::Relaxed);
     sample.is_multiple_of(16).then_some(sample)
+}
+
+/// A local marker enables splitting for just the sampled shader. This
+/// allows a fixed-camera comparison without changing the title or caches.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn trace_split_override(hash: &str) -> Option<bool> {
+    if trace_target() != Some(hash) {
+        return None;
+    }
+    use std::path::PathBuf;
+    static FILE: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    let file = FILE.get_or_init(|| std::env::var_os("VICTORY_TRACE_SPLIT_FILE").map(PathBuf::from)).as_ref()?;
+    Some(file.is_file())
 }
 
 /// Samples an uncounted one-record dispatch at the point where the clamp

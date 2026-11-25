@@ -3155,7 +3155,12 @@ impl State {
 /// counter. The only program seen asking for more in the prologue reads it.
 fn group_base_word(p: &crate::pipeline::host::HostPipeline) -> Option<(u32, u32)> {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("VICTORY_DISPATCH_SPLIT").is_none_or(|v| v != "0")) {
+    let enabled = *ON.get_or_init(|| std::env::var_os("VICTORY_DISPATCH_SPLIT").is_none_or(|v| v != "0"));
+    #[cfg(feature = "diagnostics")]
+    let enabled = p.stages.first()
+        .and_then(|stage| crate::indirect::trace_split_override(&stage.shader.hash))
+        .unwrap_or(enabled);
+    if !enabled {
         return None;
     }
     p.stages.iter().find_map(|stage| {
