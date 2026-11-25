@@ -23,6 +23,8 @@ use windows_sys::Win32::Storage::FileSystem::GetLogicalDrives;
 
 use crate::{HleExport, HleModule, hle_export};
 
+mod direct_archive;
+
 /// The host's own function: what the import would have been bound to.
 macro_rules! host {
     ($dll:literal, $name:literal: $ty:ty) => {{
@@ -191,13 +193,18 @@ fn wide(path: *const u16) -> Wide {
         return Wide(path, None);
     }
     // SAFETY: the title passes a NUL-terminated path.
-    let path_slice = unsafe {
-        let len = (0..).take_while(|&i| *path.add(i) != 0).count();
-        std::slice::from_raw_parts(path, len)
-    };
+    let path_slice = unsafe { path_slice(path) };
     let host = translate(path_slice);
     trace(path_slice, host.as_deref());
     Wide(path, host)
+}
+
+unsafe fn path_slice<'a>(path: *const u16) -> &'a [u16] {
+    // SAFETY: caller guarantees the title's path is non-null and NUL-terminated.
+    unsafe {
+        let len = (0..).take_while(|&i| *path.add(i) != 0).count();
+        std::slice::from_raw_parts(path, len)
+    }
 }
 
 /// Every title path at debug level, with the host path if rewritten.
@@ -262,6 +269,14 @@ pub extern "system" fn CreateFileW(
     flags: u32,
     template: Handle,
 ) -> Handle {
+    if let Some(root) = direct_archive::configured_root()
+        && let Some(file) = direct_archive::open_request(
+            root, path, access, share, security, disposition, flags, template,
+        )
+    {
+        use std::os::windows::io::IntoRawHandle;
+        return file.into_raw_handle();
+    }
     let p = wide(path);
     host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
         p.ptr(),
