@@ -1,7 +1,10 @@
 //! Bounded GPU readback at the blend-shape translations extractor. The
 //! diagnostic records per-binding numeric summaries after the list's fence.
 
-use std::sync::{OnceLock, atomic::{AtomicU64, Ordering}};
+use std::{
+    collections::BTreeMap,
+    sync::{Mutex, OnceLock, atomic::{AtomicU64, Ordering}},
+};
 use victory_shader::{ResourceType, UsedResource};
 use windows::Win32::Graphics::Direct3D12::*;
 
@@ -33,6 +36,8 @@ pub(crate) struct Readback {
     view_bytes: u64,
     resource_bytes: u64,
     bytes: usize,
+    shadow_id: u64,
+    shadow_offset: u64,
 }
 
 pub(crate) fn record(list: &HostList, view: &View, used: &UsedResource, sequence: u64) -> bool {
@@ -80,6 +85,7 @@ pub(crate) fn record(list: &HostList, view: &View, used: &UsedResource, sequence
         buffer, _source: src.clone(), sequence, frame: crate::frame::current(),
         slot: used.slot, dword: used.table_offset_dwords, uav,
         format: crate::resource::pc_format(format), view_bytes, resource_bytes, bytes: bytes as usize,
+        shadow_id: shadow.id(), shadow_offset: offset,
     });
     true
 }
@@ -97,17 +103,44 @@ impl Readback {
             }
             let data = std::slice::from_raw_parts(mapped.cast::<u8>(), self.bytes);
             let summary = counts(data);
+            let signature = blake3::hash(data);
             self.buffer.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
+            let key = (self.shadow_id, self.shadow_offset, self.view_bytes, self.format, self.slot, self.dword, self.uav);
+            let earlier = compare_previous(key, self.sequence, signature);
             tracing::info!(
                 hash = EXTRACTOR, d16_bits = victory_shader::emit::d16_uint(), sequence = self.sequence,
                 recorded_frame = self.frame, access = if self.uav { "UAV" } else { "SRV" },
                 slot = self.slot, dword = self.dword, dxgi_format = self.format,
                 resource_bytes = self.resource_bytes, view_bytes = self.view_bytes, sampled_bytes = self.bytes,
                 nonzero_bytes = summary.0, nonzero_finite_if_f16 = summary.1,
-                nonzero_finite_if_f32 = summary.2, "face extractor buffer sample"
+                nonzero_finite_if_f32 = summary.2, prior_sequence = earlier.map(|x| x.0),
+                changed = earlier.map(|x| x.1), "face extractor buffer sample"
             );
         }
     }
+}
+
+type Binding = (u64, u64, u64, u32, u8, u32, bool);
+type History = BTreeMap<Binding, (u64, blake3::Hash)>;
+
+// A reused descriptor slot can name a different buffer or actor. Only
+// compare the same physical shadow and view, and only in recording order.
+fn compare_previous(key: Binding, seq: u64, signature: blake3::Hash) -> Option<(u64, bool)> {
+    static HISTORY: OnceLock<Mutex<History>> = OnceLock::new();
+    let mut previous = HISTORY.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((old_seq, old_sig)) = previous.get_mut(&key) {
+        if *old_seq >= seq {
+            return None;
+        }
+        let result = (*old_seq, *old_sig != signature);
+        (*old_seq, *old_sig) = (seq, signature);
+        return Some(result);
+    }
+    if previous.len() >= 1024 {
+        previous.clear();
+    }
+    previous.insert(key, (seq, signature));
+    None
 }
 
 fn counts(data: &[u8]) -> (usize, usize, usize) {
