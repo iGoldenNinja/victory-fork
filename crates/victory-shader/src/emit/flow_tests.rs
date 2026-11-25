@@ -19,6 +19,9 @@ use super::host::{Dispatch, Draw, Host, Root, Stride, View};
 use super::valu_tests::ONE_AT_A_TIME;
 use super::{HostShader, RootType, translate, validator};
 
+#[path = "adjacent_quad_tests.rs"]
+mod adjacent_quad_tests;
+
 fn tools() -> Option<(PathBuf, PathBuf)> {
     let console = PathBuf::from(std::env::var_os("VICTORY_CONSOLE_DXC")?);
     let pc = match std::env::var_os("VICTORY_PC_DXC") {

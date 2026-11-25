@@ -1095,6 +1095,7 @@ impl Host {
                 }
             }
             list.OMSetRenderTargets(1, Some(&rtv), false, None);
+            list.ClearRenderTargetView(rtv, &[0.0; 4], None);
             list.RSSetViewports(&[D3D12_VIEWPORT {
                 Width: w as f32,
                 Height: h as f32,
