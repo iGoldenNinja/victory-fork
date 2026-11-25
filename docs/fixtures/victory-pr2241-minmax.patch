@@ -1,0 +1,64 @@
+diff --git a/crates/victory-shader/src/emit/valu_tests.rs b/crates/victory-shader/src/emit/valu_tests.rs
+index 005421c..39f9024 100644
+--- a/crates/victory-shader/src/emit/valu_tests.rs
++++ b/crates/victory-shader/src/emit/valu_tests.rs
+@@ -972,6 +972,15 @@ const fn image_atomic(op: u16, data: u8, addr: u8, rsrc: u8, dmask: u8, glc: boo
+ /// index 1. Both atomics see the value in `v2:v3` (`a`) and `v8:v9` (`b`),
+ /// their comparison/source registers zeroed.
+ fn build_atomic_cs(a: [u32; 2], b: [u32; 2], old: u8) -> HostShader {
++    build_atomic_cs_with_second(a, b, old, None)
++}
++
++fn build_atomic_cs_with_second(
++    a: [u32; 2],
++    b: [u32; 2],
++    old: u8,
++    second: Option<[u32; 2]>,
++) -> HostShader {
+     let mut words = Vec::new();
+     // s[4:5] = the descriptor table's address.
+     words.push(s_mov_b32(5, 0x80)); // inline constant 0
+@@ -988,7 +997,12 @@ fn build_atomic_cs(a: [u32; 2], b: [u32; 2], old: u8) -> HostShader {
+         words.push(vop1(0x001, i, 128));
+     }
+     for i in 8..10u8 {
+-        words.push(vop1(0x001, i, sgpr(i - 6)));
++        if let Some([lo, hi]) = second {
++            words.push(vop1(0x001, i, 255));
++            words.push(if i == 8 { lo } else { hi });
++        } else {
++            words.push(vop1(0x001, i, sgpr(i - 6)));
++        }
+     }
+     words.extend_from_slice(&a);
+     words.extend_from_slice(&b);
+@@ -1178,3 +1192,29 @@ fn wide_image_atomic_cmpswap() {
+         );
+     });
+ }
++
++#[test]
++fn wide_image_atomic_minmax_orders_whole_values() {
++    // The first operand is larger as u64 and smaller as i64. Its low word
++    // is smaller than the second's, so comparing dwords independently fails.
++    let first = [2, 0x8000_0000];
++    let second = [0xFFFF_FFFE, 0x7FFF_FFFF];
++    for (op, name, expected) in [
++        (0x014, "smin", first),
++        (0x015, "umin", second),
++        (0x016, "smax", second),
++        (0x017, "umax", first),
++    ] {
++        let shader = build_atomic_cs_with_second(
++            image_atomic(0x00F, 2, 0, 8, 3, false),
++            image_atomic(op, 8, 0, 8, 3, true),
++            8,
++            Some(second),
++        );
++        run_atomic_cases(&shader, &[[1, 0, first[0], first[1]]], |backend, _, _, texels, old| {
++            assert_eq!(&texels[2..4], &expected, "{backend}: {name} final texel");
++            assert_eq!(old, &first, "{backend}: {name} previous texel");
++            println!("{backend}: {name} old={old:08x?} result={expected:08x?}");
++        });
++    }
++}
