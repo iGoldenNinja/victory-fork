@@ -13,6 +13,8 @@ use crate::native::{
 };
 use crate::{io, ir, resource, structure};
 
+mod format_x_low_half;
+
 const S_ENDPGM: u32 = 0xBF81_0000;
 
 /// SOP1 `s_mov_b32 sdst, src0`.
@@ -153,13 +155,17 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
         code,
     };
 
+    lower_test_program(&native)
+}
+
+fn lower_test_program(native: &NativeProgram) -> HostShader {
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
     let res =
         resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
-    let io = io::raise(&p, &native).expect("io::raise");
+    let io = io::raise(&p, native).expect("io::raise");
     let lowered = lower::lower(&lower::Parts {
-        native: &native,
+        native,
         p: &p,
         st: &st,
         io: &io,
