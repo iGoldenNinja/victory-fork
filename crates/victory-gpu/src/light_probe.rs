@@ -136,6 +136,9 @@ struct Counts {
     zero_words: u32,
     nonzero_channels: [u32; 3],
     exponents: [u32; 32],
+    peak_by_channel: [f32; 3],
+    channels_at_least_point_six: [u32; 3],
+    texels_at_least_point_six: u32,
 }
 
 impl Counts {
@@ -145,10 +148,21 @@ impl Counts {
         for &word in words {
             self.zero_words += u32::from(word == 0);
             zero_rgb += u32::from(word & 0x07ff_ffff == 0);
-            for (i, n) in self.nonzero_channels.iter_mut().enumerate() {
-                *n += u32::from((word >> (i * 9)) & 511 != 0);
+            let exponent = word >> 27;
+            // RGB9E5 uses a nine-bit mantissa and a scale of 2^(exponent - 24).
+            let scale = 2.0f32.powi(exponent as i32 - 24);
+            let mut any_at_threshold = false;
+            for i in 0..3 {
+                let mantissa = (word >> (i * 9)) & 511;
+                let value = mantissa as f32 * scale;
+                self.nonzero_channels[i] += u32::from(mantissa != 0);
+                self.peak_by_channel[i] = self.peak_by_channel[i].max(value);
+                let at_threshold = value >= 0.6;
+                self.channels_at_least_point_six[i] += u32::from(at_threshold);
+                any_at_threshold |= at_threshold;
             }
-            self.exponents[(word >> 27) as usize] += 1;
+            self.texels_at_least_point_six += u32::from(any_at_threshold);
+            self.exponents[exponent as usize] += 1;
         }
         zero_rgb
     }
@@ -255,6 +269,9 @@ impl Readback {
             format = "R32_UINT", width = self.width, height = self.height, sampled_rows = self.rows,
             pixels, zero_rgb, nonzero_rgb = pixels - zero_rgb, zero_words = counts.zero_words,
             zero_by_band = ?&zero_by_band[..self.rows as usize], nonzero_channels = ?counts.nonzero_channels,
+            peak_by_channel = ?counts.peak_by_channel,
+            channels_at_least_point_six = ?counts.channels_at_least_point_six,
+            texels_at_least_point_six = counts.texels_at_least_point_six,
             exponents = ?counts.exponents, "original temporal resolve light sample");
     }
 }
@@ -296,6 +313,19 @@ pub(crate) mod tests {
         assert_eq!(c.nonzero_channels, [2, 2, 2]);
         assert_eq!(c.exponents[31], 2);
         assert_eq!(c.exponents[0], 4);
+    }
+
+    #[test]
+    fn decoded_channels_and_distinct_texels_reach_the_threshold() {
+        let pack = |e: u32, r: u32, g: u32, b: u32| (e << 27) | (b << 18) | (g << 9) | r;
+        let mut counts = Counts::default();
+        let first = [pack(31, 0, 0, 0), pack(14, 511, 511, 511), pack(15, 307, 308, 0)];
+        assert_eq!(counts.row(&first), 1);
+        let second = [pack(16, 154, 0, 511), pack(15, 306, 511, 408), pack(31, 0, 0, 511)];
+        assert_eq!(counts.row(&second), 0);
+        assert_eq!(counts.channels_at_least_point_six, [1, 2, 3]);
+        assert_eq!(counts.texels_at_least_point_six, 4);
+        assert_eq!(counts.peak_by_channel, [154.0 / 256.0, 511.0 / 512.0, 65408.0]);
     }
 
     /// A real texture with padded row pitches and four discarded rows. The
@@ -437,6 +467,9 @@ pub(crate) mod tests {
         }
         assert_eq!(counts.exponents, exponents);
         assert_eq!(counts.nonzero_channels, [4, 0, 4]);
+        assert_eq!(counts.peak_by_channel, [1.0 / 16384.0, 0.0, 1.0 / 4096.0]);
+        assert_eq!(counts.channels_at_least_point_six, [0, 0, 0]);
+        assert_eq!(counts.texels_at_least_point_six, 0);
         // SAFETY: the copy of all twelve rows has completed. Read only the
         // three valid words per row, including the rows the probe skipped.
         unsafe {
