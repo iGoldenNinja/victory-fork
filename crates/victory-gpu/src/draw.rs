@@ -1094,12 +1094,16 @@ impl State {
                     let guest = view_at(target.dword).as_ref().map_or(0, crate::capture::lineage::guest_resource);
                     let watched = |dword| {
                         let index = crate::capture::lineage::host_index(values[u.index as usize], dword)?;
-                        Some((heap.watch_slot(index), view_at(dword)))
+                        let view = view_at(dword);
+                        let mut slot = heap.watch_slot(index);
+                        if let Some(View::Constant(_, size)) = &view { slot.watch_constant(list, *size); }
+                        Some((slot, view))
                     };
                     let input = target.input_dword.and_then(watched);
                     let extra = target.extra_dword.and_then(watched);
+                    let feed_constant = target.feed_constant.and_then(watched);
                     self.traced_binding = Some(crate::capture::lineage::Binding {
-                        frame, target, slot: heap.watch_slot(index), guest, input, extra,
+                        frame, target, slot: heap.watch_slot(index), guest, input, extra, feed_constant,
                     });
                 }
                 // SAFETY: an open list; `values` covers the parameter.

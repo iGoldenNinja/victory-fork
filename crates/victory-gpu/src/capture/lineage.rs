@@ -49,6 +49,7 @@ pub(crate) struct Target {
     writer: bool,
     pub input_dword: Option<u32>,
     pub extra_dword: Option<u32>,
+    pub feed_constant: Option<u32>,
     producer: bool,
     rect: [u32; 4],
 }
@@ -59,7 +60,7 @@ pub(crate) fn target(hash: &str, compute: bool) -> Option<Target> {
     if compute && let Some(cfg) = upstream
         && let Some(shader) = cfg.shaders.iter().find(|h| h.as_str() == hash) {
         return Some(Target { table: cfg.table, dword: cfg.output, shader, writer: true,
-            input_dword: Some(cfg.list), extra_dword: Some(cfg.constant), producer: true, rect: cfg.rect });
+            input_dword: Some(cfg.list), extra_dword: Some(cfg.constant), feed_constant: None, producer: true, rect: cfg.rect });
     }
     let (table, dword, shader) = if compute {
         if pass.hash != hash { return None; }
@@ -71,7 +72,8 @@ pub(crate) fn target(hash: &str, compute: bool) -> Option<Target> {
     };
     let extra_dword = upstream.filter(|cfg| compute && cfg.table == table).map(|cfg| cfg.downstream);
     Some(Target { table, dword, shader, writer: compute, input_dword: compute.then_some(pass.srv),
-        extra_dword, producer: false, rect: pass.rect })
+        extra_dword, feed_constant: upstream.filter(|_| extra_dword.is_some()).and_then(|c| c.downstream_constant),
+        producer: false, rect: pass.rect })
 }
 
 pub(crate) fn host_index(root_bytes: u32, dword: u32) -> Option<u32> {
@@ -85,6 +87,7 @@ pub(crate) struct Binding {
     pub guest: usize,
     pub input: Option<(WatchedSlot, Option<View>)>,
     pub extra: Option<(WatchedSlot, Option<View>)>,
+    pub feed_constant: Option<(WatchedSlot, Option<View>)>,
 }
 
 pub(crate) fn guest_resource(view: &View) -> usize {
@@ -192,6 +195,14 @@ impl Binding {
             tracing::info!(id=extra_id, frame, role="extra-input", writer=id, shader=t.shader, dword=t.extra_dword,
                 heap=slot.heap, index=slot.index, native=native(resource.as_ref()), sampled, "descriptor trace binding");
             list.defer_descriptor_event(Event { id: extra_id, frame, slot: Some(slot) });
+        }
+        if let Some((slot, view)) = self.feed_constant {
+            let input_id = next_id();
+            let resource = slot.resource();
+            let sampled = super::producer::sample_slot(list, &slot, view.as_ref(), frame, format!("slot-{id}-feed-constants"));
+            tracing::info!(id=input_id, frame, role="feed-constant", writer=id, shader=t.shader, dword=t.feed_constant,
+                heap=slot.heap, index=slot.index, native=native(resource.as_ref()), sampled, "descriptor trace binding");
+            list.defer_descriptor_event(Event { id: input_id, frame, slot: Some(slot) });
         }
         let sampled = actual.as_ref().is_some_and(|r| sample(r, source_state, "bound-before"));
         let rt_before = target.as_ref().is_some_and(|r| sample(r, D3D12_RESOURCE_STATE_RENDER_TARGET, "rt-before"));

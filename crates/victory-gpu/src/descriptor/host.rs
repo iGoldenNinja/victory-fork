@@ -20,16 +20,38 @@ type KeptSlots = std::sync::Arc<SlotResources>;
 type KeptSlots = SlotResources;
 
 #[cfg(feature = "diagnostics")]
+type UploadConstants = std::sync::Arc<Mutex<std::collections::HashMap<u32, (u64, u32)>>>;
+
+#[cfg(feature = "diagnostics")]
 pub(crate) struct WatchedSlot {
     pub heap: usize,
     pub index: u32,
     slots: KeptSlots,
+    constants: Option<UploadConstants>,
+    scratch: Option<(u64, u32, ID3D12Resource, u64)>,
 }
 
 #[cfg(feature = "diagnostics")]
 impl WatchedSlot {
     pub fn resource(&self) -> Option<ID3D12Resource> {
+        if self.scratch.is_some() { return self.scratch_range().map(|(r, _)| r); }
         self.slots.lock().unwrap_or_else(|e| e.into_inner()).get(self.index as usize)?.clone()
+    }
+
+    fn written_constant(&self) -> Option<(u64, u32)> {
+        self.constants.as_ref()?.lock().unwrap_or_else(|e| e.into_inner()).get(&self.index).copied()
+    }
+
+    pub(crate) fn watch_constant(&mut self, list: &crate::host::HostList, bytes: u32) {
+        if let Some((gpu, size)) = self.written_constant()
+            && bytes == size && let Some((buffer, offset)) = list.captured_scratch(gpu, u64::from(size)) {
+            self.scratch = Some((gpu, size, buffer, offset));
+        }
+    }
+
+    pub(crate) fn scratch_range(&self) -> Option<(ID3D12Resource, u64)> {
+        let (gpu, size, buffer, offset) = self.scratch.as_ref()?;
+        (self.written_constant()? == (*gpu, *size)).then(|| (buffer.clone(), *offset))
     }
 }
 
@@ -55,6 +77,8 @@ pub(crate) struct HostHeap {
     /// released the resource may still be read, and a freed host resource
     /// read there is a GPU page fault (the console reads stale memory).
     kept: KeptSlots,
+    #[cfg(feature = "diagnostics")]
+    constants: Option<UploadConstants>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
@@ -973,6 +997,8 @@ impl HostHeap {
             made: Mutex::new(vec![0; count as usize]),
             copied: Mutex::new(Vec::new()),
             kept: Mutex::new(vec![None; (count + extra) as usize]).into(),
+            #[cfg(feature = "diagnostics")]
+            constants: crate::capture::watches_upload_constants().then(Default::default),
             next: Mutex::new((0, vec![false; DYNAMIC as usize])),
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
@@ -1679,6 +1705,10 @@ impl HostHeap {
 
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
+        #[cfg(feature = "diagnostics")]
+        if index >= self.count && let Some(constants) = &self.constants {
+            constants.lock().unwrap_or_else(|e| e.into_inner()).remove(&index);
+        }
         let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(slot) = kept.get_mut(index as usize) {
             // A running submission may still read the old resource through
@@ -1806,6 +1836,10 @@ impl HostHeap {
             host.device
                 .CreateConstantBufferView(Some(&desc), self.cpu(index))
         };
+        #[cfg(feature = "diagnostics")]
+        if let Some(constants) = &self.constants {
+            constants.lock().unwrap_or_else(|e| e.into_inner()).insert(index, (gpu, size));
+        }
     }
 
     fn cpu(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
@@ -2046,7 +2080,8 @@ impl HostHeap {
     #[cfg(feature = "diagnostics")]
     pub(crate) fn watch_slot(&self, index: u32) -> WatchedSlot {
         use windows::core::Interface;
-        WatchedSlot { heap: self.heap.as_raw() as usize, index, slots: self.kept.clone() }
+        WatchedSlot { heap: self.heap.as_raw() as usize, index, slots: self.kept.clone(),
+            constants: self.constants.clone(), scratch: None }
     }
 
     /// What the queue of textures picked by index knows of title slot

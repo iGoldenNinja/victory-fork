@@ -6612,6 +6612,16 @@ impl HostList {
         Some((gpu + at, (data + at as usize) as *mut u8))
     }
 
+    /// The subrange of an upload chunk actually named by a dynamic CBV on this list.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn captured_scratch(&self, gpu: u64, len: u64) -> Option<(ID3D12Resource, u64)> {
+        let scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+        scratch.chunks.iter().find_map(|(chunk, size)| {
+            let offset = gpu.checked_sub(chunk.gpu)?;
+            (len != 0 && offset.checked_add(len)? <= *size).then(|| (chunk._buffer.clone(), offset))
+        })
+    }
+
     /// The bytes of scratch chunks the list holds now (after a reset:
     /// none while lists share their chunks).
     pub(crate) fn scratch_kept(&self) -> u64 {
