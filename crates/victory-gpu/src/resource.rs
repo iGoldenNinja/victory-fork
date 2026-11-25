@@ -2563,7 +2563,40 @@ pub(crate) fn texture_kind(this: This) -> Option<(u64, u32, u32)> {
         return None;
     }
     let r = resource(this);
-    (r.desc.dimension != BUFFER).then_some((r.desc.width, r.desc.height, r.desc.format))
+    water_candidate(&r.desc).then_some((r.desc.width, r.desc.height, r.desc.format))
+}
+
+#[cfg(windows)]
+fn water_candidate(desc: &ResourceDesc) -> bool {
+    desc.dimension == 3
+        && desc.depth_or_array_size == 1
+        && desc.mip_levels == 1
+        && desc.sample_count == 1
+        && matches!((desc.width, desc.height, desc.format),
+            (64, 64, 16) | (128, 128, 36) | (256, 256, 16 | 41))
+}
+
+/// Keep the guest resource and its heap alive through list completion.
+#[cfg(windows)]
+pub(crate) struct WaterResource(usize);
+
+#[cfg(windows)]
+impl WaterResource {
+    pub(crate) fn retain(this: This) -> Self {
+        object::add_ref(this);
+        Self(this as usize)
+    }
+
+    pub(crate) fn get(&self) -> This {
+        self.0 as This
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WaterResource {
+    fn drop(&mut self) {
+        resource_release(self.get());
+    }
 }
 
 /// Texture `this`'s console layout (one plane), where it lies in title
@@ -2582,7 +2615,8 @@ pub(crate) fn title_texture(this: This) -> Option<(victory_formats::texture::Lay
     let [plane] = &t.planes[..] else {
         return None;
     };
-    Some((plane.layout.clone(), r.data() as usize, t.size as usize))
+    (plane.offset == 0 && plane.layout.addressable() && !r.data().is_null())
+        .then(|| (plane.layout.clone(), r.data() as usize, t.size as usize))
 }
 
 /// The bytes of title memory a texture with the resource description
@@ -2890,6 +2924,51 @@ mod tests {
             mip_levels: mips,
             layout: 0,
             ..buffer(0)
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn only_single_water_planes_match_copyback() {
+        for (width, format) in [(64, 16), (128, 36), (256, 16), (256, 41)] {
+            let desc = texture(width, width as u32, format, 1);
+            assert!(water_candidate(&desc));
+            assert!(!water_candidate(&ResourceDesc { dimension: 4, ..desc }));
+            assert!(!water_candidate(&ResourceDesc { depth_or_array_size: 2, ..desc }));
+            assert!(!water_candidate(&ResourceDesc { sample_count: 4, ..desc }));
+            assert!(!water_candidate(&ResourceDesc { mip_levels: 0, ..desc }));
+            assert!(!water_candidate(&ResourceDesc { mip_levels: 2, ..desc }));
+            assert!(!water_candidate(&ResourceDesc { format: 42, ..desc }));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn water_planes_roundtrip_with_pitched_rows() {
+        for (side, format) in [(64, 16), (128, 36), (256, 16), (256, 41)] {
+            let (bytes, _) = element(format).unwrap();
+            let width = side as usize * bytes as usize;
+            let pitch = width + 256;
+            let length = (side as usize - 1) * pitch + width;
+            for mode in [0, 1] {
+                let desc = ResourceDesc { layout: mode, ..texture(side, side as u32, format, 1) };
+                let t = texture_layout(&desc).unwrap();
+                let plane = &t.planes[0].layout;
+                let mut tiled = vec![0x5a; t.size as usize];
+                let mut src = vec![0; length];
+                for (y, row) in src.chunks_mut(pitch).enumerate() {
+                    for (x, byte) in row[..width].iter_mut().enumerate() {
+                        *byte = (x ^ (x >> 8) ^ y.wrapping_mul(31)) as u8;
+                    }
+                }
+                let mut restored = vec![0xa5; length];
+                plane.tile(&mut tiled, 0, 0, &src, pitch, pitch * side as usize).unwrap();
+                plane.detile(&tiled, 0, 0, &mut restored, pitch, pitch * side as usize).unwrap();
+                for (actual, expected) in restored.chunks(pitch).zip(src.chunks(pitch)) {
+                    assert_eq!(&actual[..width], &expected[..width]);
+                    assert!(actual[width..].iter().all(|&b| b == 0xa5));
+                }
+            }
         }
     }
 

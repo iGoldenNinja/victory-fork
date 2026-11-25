@@ -1917,7 +1917,7 @@ struct Deferred {
     backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
     /// Title textures of the kinds copied back ([`crate::texback`]) that
     /// the list's shaders write, copied when the list closes.
-    back_wanted: Vec<usize>,
+    back_wanted: Vec<crate::resource::WaterResource>,
     /// Those copies, whose texels go to title memory once the list has run.
     texture_backs: Vec<crate::texback::Back>,
     #[cfg(feature = "diagnostics")]
@@ -6213,8 +6213,8 @@ impl HostList {
             return;
         }
         let mut deferred = self.deferred();
-        if !deferred.back_wanted.contains(&(resource as usize)) {
-            deferred.back_wanted.push(resource as usize);
+        if !deferred.back_wanted.iter().any(|held| held.get() == resource) {
+            deferred.back_wanted.push(crate::resource::WaterResource::retain(resource));
         }
     }
 
@@ -6224,8 +6224,7 @@ impl HostList {
         const COPY_SOURCE: u32 = 0x800;
         let wanted = std::mem::take(&mut self.deferred().back_wanted);
         for resource in wanted {
-            let resource = resource as crate::object::This;
-            let Some(copy) = crate::resource::host_copy(resource) else {
+            let Some(copy) = crate::resource::host_copy(resource.get()) else {
                 continue;
             };
             self.settle(&copy, COPY_SOURCE);

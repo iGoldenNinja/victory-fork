@@ -8,8 +8,7 @@
 //! the title read those two kinds), and boats sank.
 //!
 //! For textures of the kinds in `VICTORY_TEXTURE_BACK` (comma-separated
-//! `<width>x<height>f<format>`; `0` for none; by default the kinds the read
-//! watch found the title reading), a list in which shaders write one copies it
+//! `<width>x<height>f<format>`; `0` or unset for none), a list in which shaders write one copies it
 //! into a read-back buffer of ours when it closes, and once the list has run
 //! the texels are tiled into the texture's title memory in the console's
 //! layout, as the console's GPU would have left them.
@@ -29,8 +28,7 @@ use crate::object::This;
 fn kinds() -> &'static [(u64, u32, u32)] {
     static KINDS: OnceLock<Vec<(u64, u32, u32)>> = OnceLock::new();
     KINDS.get_or_init(|| {
-        const DEFAULT: &str = "256x256f41,256x256f16,64x64f16,128x128f36";
-        let list = std::env::var("VICTORY_TEXTURE_BACK").unwrap_or_else(|_| DEFAULT.to_owned());
+        let list = std::env::var("VICTORY_TEXTURE_BACK").unwrap_or_default();
         let kinds: Vec<(u64, u32, u32)> = list
             .split(',')
             .filter_map(|k| {
@@ -57,94 +55,113 @@ pub(crate) fn wanted(resource: This) -> bool {
 /// its texels go once the list has run.
 pub(crate) struct Back {
     buffer: ID3D12Resource,
-    footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
-    rows: Vec<u32>,
-    mips: u32,
+    // The guest resource owns its backing allocation or placed-heap reference.
+    _owner: crate::resource::WaterResource,
+    footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+    total: usize,
     layout: victory_formats::texture::Layout,
-    /// The texture's title memory and its layout's bytes.
     at: usize,
     size: usize,
 }
 
-/// Records into `list` the copy of `texture` (title resource `resource`'s
-/// host copy, in the copy-source state) into a read-back buffer.
-pub(crate) fn record(list: &ID3D12GraphicsCommandList, resource: This, texture: &ID3D12Resource) -> Option<Back> {
+pub(crate) fn record(
+    list: &ID3D12GraphicsCommandList,
+    resource: crate::resource::WaterResource,
+    texture: &ID3D12Resource,
+) -> Option<Back> {
     let host = crate::host::host()?;
-    let (layout, at, size) = crate::resource::title_texture(resource)?;
-    // SAFETY: a live texture.
+    let (layout, at, size) = crate::resource::title_texture(resource.get())?;
+    // SAFETY: the list owns the host texture.
     let desc = unsafe { texture.GetDesc() };
-    let mips = u32::from(desc.MipLevels.max(1));
-    let subresources = mips * u32::from(desc.DepthOrArraySize.max(1));
-    let n = subresources as usize;
-    let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); n];
-    let mut rows = vec![0u32; n];
-    let mut total = 0u64;
-    // SAFETY: out arrays of `n` entries.
+    let (width, height, format) = crate::resource::texture_kind(resource.get())?;
+    if desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        || desc.MipLevels != 1 || desc.DepthOrArraySize != 1 || desc.SampleDesc.Count != 1
+        || (desc.Width, desc.Height, desc.Format.0 as u32) != (width, height, format)
+    {
+        return None;
+    }
+    let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+    let mut total = 0;
+    // SAFETY: one single-plane 2D subresource, one footprint.
     unsafe {
         host.device.GetCopyableFootprints(
-            &desc,
-            0,
-            subresources,
-            0,
-            Some(footprints.as_mut_ptr()),
-            Some(rows.as_mut_ptr()),
-            None,
-            Some(&mut total),
-        )
-    };
-    let buffer = host.read_back_buffer(total)?;
-    for (i, footprint) in footprints.iter().enumerate() {
-        let to = D3D12_TEXTURE_COPY_LOCATION {
-            // SAFETY: a borrowed pointer the location never releases.
-            pResource: unsafe { std::mem::transmute_copy(&buffer) },
-            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *footprint },
-        };
-        let from = D3D12_TEXTURE_COPY_LOCATION {
-            // SAFETY: as above.
-            pResource: unsafe { std::mem::transmute_copy(texture) },
-            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: i as u32 },
-        };
-        // SAFETY: an open list; the texture is in the copy-source state.
-        unsafe { list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+            &desc, 0, 1, 0, Some(&mut footprint), None, None, Some(&mut total),
+        );
     }
-    COPIED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    Some(Back { buffer, footprints, rows, mips, layout, at, size })
+    if footprint.Offset != 0 || total == 0 || total == u64::MAX {
+        return None;
+    }
+    let buffer = host.read_back_buffer(total)?;
+    let to = D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: borrowed interface retained by Back.
+        pResource: unsafe { std::mem::transmute_copy(&buffer) },
+        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint },
+    };
+    let from = D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: borrowed interface retained by the list.
+        pResource: unsafe { std::mem::transmute_copy(texture) },
+        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+    };
+    // SAFETY: open list with the source in COPY_SOURCE.
+    unsafe { list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+    Some(Back { buffer, _owner: resource, footprint, total: total as usize, layout, at, size })
 }
 
-/// Textures copied back since the start.
-pub(crate) static COPIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Once the list that recorded `back` has run: its texels, tiled into the
-/// title's layout, into the texture's title memory.
+/// Merge the completed plane with the current guest padding while mappings are stable.
 pub(crate) fn land(back: &Back) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use windows_sys::Win32::System::{
+        Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory}, Threading::GetCurrentProcess,
+    };
+    let Some(_reading) = crate::watch::title_memory_reading_now() else {
+        return;
+    };
     let mut tiled = vec![0u8; back.size];
-    // Bytes of title memory the subresources do not cover stay as they are.
-    crate::host::copy_mapped(tiled.as_mut_ptr(), back.at as *const u8, back.size, false);
+    let mut done = 0;
+    // SAFETY: the kernel checks guest pages and tiled owns the full destination.
+    let process = unsafe { GetCurrentProcess() };
+    let ok = unsafe {
+        ReadProcessMemory(process, back.at as _, tiled.as_mut_ptr().cast(), tiled.len(), &mut done)
+    };
+    if ok == 0 || done != tiled.len() {
+        return;
+    }
     let mut data = std::ptr::null_mut();
-    // SAFETY: our read-back buffer, written by the list that has run.
-    unsafe {
-        if back.buffer.Map(0, None, Some(&mut data)).is_err() || data.is_null() {
-            return;
-        }
+    // SAFETY: the list has completed and the host retains the readback buffer.
+    if unsafe { back.buffer.Map(0, None, Some(&mut data)) }.is_err() || data.is_null() {
+        return;
     }
-    for (i, (footprint, &rows)) in back.footprints.iter().zip(&back.rows).enumerate() {
-        let (mip, slice) = (i as u32 % back.mips, i as u32 / back.mips);
-        let f = footprint.Footprint;
-        let pitch = f.RowPitch as usize;
-        let len = pitch * rows as usize * f.Depth as usize;
-        // SAFETY: the subresource's part of the mapped buffer.
-        let linear = unsafe { std::slice::from_raw_parts(data.cast::<u8>().add(footprint.Offset as usize), len) };
-        if let Err(e) = back.layout.tile(&mut tiled, mip, slice, linear, pitch, pitch * rows as usize) {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(?e, mip, slice, "a texture copied back could not be tiled"));
-            // SAFETY: mapped above.
-            unsafe { back.buffer.Unmap(0, None) };
-            return;
-        }
-    }
-    // SAFETY: mapped above.
+    // SAFETY: the allocation is exactly GetCopyableFootprints' total byte count.
+    let linear = unsafe { std::slice::from_raw_parts(data.cast::<u8>(), back.total) };
+    let pitch = back.footprint.Footprint.RowPitch as usize;
+    let depth_pitch = pitch * back.footprint.Footprint.Height as usize;
+    let result = back.layout.tile(&mut tiled, 0, 0, linear, pitch, depth_pitch);
+    // SAFETY: the CPU only read the completed buffer.
     unsafe { back.buffer.Unmap(0, None) };
-    crate::host::copy_mapped(back.at as *mut u8, tiled.as_ptr(), back.size, true);
+    if result.is_err() {
+        return;
+    }
+    crate::watch::writing(back.at, back.size);
+    // SAFETY: tiled is valid for size bytes; the kernel checks the guest destination.
+    done = 0;
+    let ok = unsafe {
+        WriteProcessMemory(process, back.at as _, tiled.as_ptr().cast(), tiled.len(), &mut done)
+    };
+    if done != 0 {
+        crate::watch::wrote(back.at, done);
+    }
+    if ok != 0 && done == tiled.len() {
+        static WRITES: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+        let f = &back.footprint.Footprint;
+        let index = match (f.Width, f.Format.0) {
+            (64, 16) => 0, (128, 36) => 1, (256, 16) => 2, (256, 41) => 3, _ => return,
+        };
+        let completed = WRITES[index].fetch_add(1, Ordering::Relaxed) + 1;
+        if completed.is_power_of_two() {
+            tracing::info!(width = f.Width, height = f.Height, format = f.Format.0, completed,
+                "water texture written to guest memory");
+        }
+    }
 }
