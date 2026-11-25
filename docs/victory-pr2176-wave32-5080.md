@@ -17,4 +17,6 @@ The synthetic compute fixture has one 64-thread guest wave. Thread `i` supplies 
 
 With host Wave32 lowering enabled, the translated DXIL validated, created a compute pipeline and executed. Lanes 0–31 all wrote `1000`, and lanes 32–63 all wrote `1032`. This agrees with the patch's masking of the requested index to five bits and subsequent use of the current host wave. The fixture reproduced the wrong output on hardware and failed its guest-semantics assertion.
 
+The fixture patch applies to the pinned PR revision. With the DXIL validator available, run `cargo test --profile diag -p victory-shader --lib wave64_host32_reads_logical_lane_32 -- --nocapture --test-threads=1` on a 32-lane D3D12 adapter. [Synthetic fixture patch](https://github.com/iGoldenNinja/victory-fork/blob/aa41416ee9b7733981c8057cbf7b4dbfff07eda4/docs/victory-pr2176-synthetic-cross-half.patch)
+
 OpenAI Codex (GPT-6) built the test harness, ran the tests, and drafted this report.
