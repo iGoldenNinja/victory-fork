@@ -82,16 +82,21 @@ pub(crate) fn skip_wc_compare() -> bool {
     })
 }
 
-/// Whether the title buffer at `start` lies in memory the title reserved
-/// write-combining (needs the census or a skip switch on, which record the
-/// reservations).
-pub(crate) fn is_wc(start: u64) -> bool {
-    RESERVATIONS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .range(..=start as usize)
-        .next_back()
-        .is_some_and(|(base, r)| *base + r.len > start as usize && r.protect & 0x400 != 0)
+/// Every declared title range must lie wholly inside a single WC reservation.
+/// A card copy (especially an aligned loose window) can cover several.
+pub(crate) fn all_wc(ranges: &[(usize, usize)]) -> bool {
+    let reservations = RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner());
+    all_wc_in(&reservations, ranges)
+}
+
+fn all_wc_in(reservations: &BTreeMap<usize, Reservation>, ranges: &[(usize, usize)]) -> bool {
+    !ranges.is_empty() && ranges.iter().all(|&(from, to)| {
+        // Seeking from the exclusive end also detects a new reservation
+        // beginning inside the range. An allocation ending at `to` fits.
+        from < to && reservations.range(..to).next_back().is_some_and(|(&base, r)| {
+            base <= from && r.protect & 0x400 != 0 && base.checked_add(r.len).is_some_and(|end| to <= end)
+        })
+    })
 }
 
 /// Declared ranges left out of the compare by [`skip_wc_compare`].
@@ -101,13 +106,13 @@ pub(crate) static UNCOMPARED: std::sync::atomic::AtomicU64 = std::sync::atomic::
 pub(crate) static SKIPPED: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
-/// With [`skip_wc_back`]: whether a piece of `bytes` of the copy of the
-/// title buffer at `start` is left on the card (counted).
-pub(crate) fn skip_back(start: u64, bytes: u64) -> bool {
+/// A flagged piece is clipped to its declaration. Keep every piece of a
+/// mixed declaration so the normal read-back covers it in full.
+pub(crate) fn skip_back(declared: (usize, usize), bytes: u64) -> bool {
     if !skip_wc_back() {
         return false;
     }
-    let wc = is_wc(start);
+    let wc = all_wc(&[declared]);
     if wc {
         use std::sync::atomic::Ordering;
         let n = SKIPPED[0].fetch_add(1, Ordering::Relaxed) + 1;
@@ -117,6 +122,45 @@ pub(crate) fn skip_back(start: u64, bytes: u64) -> bool {
         }
     }
     wc
+}
+
+#[cfg(test)]
+mod wc_tests {
+    use super::{Reservation, all_wc_in};
+    use std::collections::BTreeMap;
+
+    fn reservation(len: usize, protect: u32) -> Reservation {
+        Reservation { len, kind: 0, flags: 0, protect }
+    }
+
+    #[test]
+    fn a_write_in_the_ordinary_half_of_a_card_window_still_comes_back() {
+        const MIB: usize = 1 << 20;
+        let window = 8 * MIB;
+        let middle = window + 2 * MIB;
+        let map = BTreeMap::from([(window, reservation(2 * MIB, 0x404)), (middle, reservation(2 * MIB, 0x04))]);
+        let wc = (middle - 65536, middle);
+        let ordinary = (middle, middle + 65536);
+        assert!(all_wc_in(&map, &[wc]));
+        assert!(!all_wc_in(&map, &[ordinary]));
+        assert!(!all_wc_in(&map, &[wc, ordinary]));
+        assert!(!all_wc_in(&map, &[(wc.0, ordinary.1)]));
+    }
+
+    #[test]
+    fn a_declaration_must_fit_one_known_reservation() {
+        let map = BTreeMap::from([
+            (0x10000, reservation(0x10000, 0x404)),
+            (0x20000, reservation(0x10000, 0x404)),
+            (usize::MAX - 8, reservation(16, 0x404)),
+        ]);
+        assert!(all_wc_in(&map, &[(0x10000, 0x20000), (0x20000, 0x30000)]));
+        assert!(!all_wc_in(&map, &[(0x1ffff, 0x20001)]));
+        assert!(!all_wc_in(&map, &[(0x30000, 0x30001)]));
+        assert!(!all_wc_in(&map, &[(0x10000, 0x10000)]));
+        assert!(!all_wc_in(&map, &[(usize::MAX - 8, 1)]));
+        assert!(!all_wc_in(&map, &[(usize::MAX - 8, usize::MAX)]));
+    }
 }
 
 /// Host resources made, by where: count and bytes ([`made`]).
