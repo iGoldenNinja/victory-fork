@@ -2495,6 +2495,9 @@ static LATE_STATS: [std::sync::atomic::AtomicU64; 18] = [const { std::sync::atom
 /// card, by why they settled (the `WHY_` places).
 static LATE_WAITED: [std::sync::atomic::AtomicU64; 11] = [const { std::sync::atomic::AtomicU64::new(0) }; 11];
 
+#[cfg(feature = "diagnostics")]
+mod read_wait;
+
 /// Whether `[from, to)` touches one of `ranges` (in order, joined).
 fn touches(ranges: &[(usize, usize)], from: usize, to: usize) -> bool {
     if from >= to {
@@ -2572,7 +2575,10 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         if count {
                             LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
                             #[cfg(feature = "diagnostics")]
-                            fill_check::blocked_copy(written, dst, src, len);
+                            {
+                                read_wait::first_blocker(read_wait::Kind::Copy, len);
+                                fill_check::blocked_copy(written, dst, src, len);
+                            }
                         }
                         return Some(WHY_READ);
                     }
@@ -2590,7 +2596,10 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         if count {
                             LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
                             #[cfg(feature = "diagnostics")]
-                            fill_check::blocked(written, src, len);
+                            {
+                                read_wait::first_blocker(read_wait::Kind::Fill, len);
+                                fill_check::blocked(written, src, len);
+                            }
                         }
                         return Some(WHY_READ);
                     }
@@ -2600,6 +2609,8 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     if touches(written, at, at + len) {
                         if count {
                             LATE_STATS[17].fetch_add(1, Ordering::Relaxed);
+                            #[cfg(feature = "diagnostics")]
+                            read_wait::first_blocker(read_wait::Kind::Texture, len);
                         }
                         return Some(WHY_READ);
                     }
@@ -2845,6 +2856,7 @@ mod fill_check {
             return;
         }
         let differ = before.iter().zip(&now).filter(|(a, b)| a != b).count() as u64;
+        super::read_wait::checked(super::read_wait::Kind::Fill, len, differ > 0, false);
         let n = CHECKED[0].fetch_add(1, Relaxed) + 1;
         if differ > 0 {
             let bad = CHECKED[1].fetch_add(1, Relaxed) + 1;
@@ -2921,6 +2933,7 @@ mod fill_check {
         }
         let n = COPIES[0].fetch_add(1, Relaxed) + 1;
         let (src_changed, dst_changed) = (a != src_before, b != dst_before);
+        super::read_wait::checked(super::read_wait::Kind::Copy, len, src_changed, dst_changed);
         if src_changed {
             COPIES[1].fetch_add(1, Relaxed);
         }
@@ -3210,6 +3223,10 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     let us = waiting.elapsed().as_micros() as u64;
     LATE_STATS[12].fetch_add(us, Ordering::Relaxed);
     LATE_WAITED[why.min(10)].fetch_add(us, Ordering::Relaxed);
+    #[cfg(feature = "diagnostics")]
+    if why == WHY_READ {
+        read_wait::waited(us);
+    }
     submission_us(1, us);
 }
 
@@ -3345,6 +3362,8 @@ fn late_line(frames: f64) {
     }
     #[cfg(feature = "diagnostics")]
     fill_check::line();
+    #[cfg(feature = "diagnostics")]
+    read_wait::line();
     fill_ahead::line(frames);
     let s: Vec<f64> = LATE_STATS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
@@ -5217,6 +5236,10 @@ impl Host {
                 let gpu = waiting.elapsed();
                 LATE_STATS[12].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
                 LATE_WAITED[why.min(10)].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
+                #[cfg(feature = "diagnostics")]
+                if why == WHY_READ {
+                    read_wait::waited(gpu.as_micros() as u64);
+                }
                 submission_us(1, gpu.as_micros() as u64);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::card_waited(gpu.as_micros() as u64, || {
@@ -5332,6 +5355,10 @@ impl Host {
                 relay_wait(why, |line| blocked_by(&line.written, runs, false).is_none());
             } else {
                 self.settle(&mut submitted, why);
+            }
+            #[cfg(feature = "diagnostics")]
+            if why == WHY_READ {
+                read_wait::finished();
             }
         }
         // Descriptors the title copied into placed heaps directly, before
