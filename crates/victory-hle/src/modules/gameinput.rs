@@ -23,6 +23,8 @@ use crate::{HleExport, HleModule};
 
 #[cfg(windows)]
 pub(super) mod window_buttons;
+#[cfg(all(feature = "diagnostics", windows))]
+mod replay;
 
 /// The documented errors.
 pub const DEVICE_DISCONNECTED: HRESULT = 0x838A_0001_u32 as i32;
@@ -1174,6 +1176,7 @@ mod host {
                         pad.buttons |= button;
                     }
                 }
+                super::replay::apply_to_pad(&mut pad, &super::replay::keys());
             }
             Some(pad)
         }
@@ -1181,6 +1184,8 @@ mod host {
         fn keys(&mut self) -> Vec<KeyState> {
             #[cfg(feature = "diagnostics")]
             let mut down = scripted();
+            #[cfg(feature = "diagnostics")]
+            down.extend(super::replay::keys());
             #[cfg(not(feature = "diagnostics"))]
             let mut down = Vec::new();
             if focused() {
