@@ -1215,6 +1215,17 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn fresh_half_table_includes_the_last_accessed_descriptor() {
+        check_half_view_binding(10); // R16G16B16A16_FLOAT
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn original_half_table_refreshes_the_last_accessed_descriptor() {
+        check_half_view_binding(12); // R16G16B16A16_UINT
+    }
+
+    #[cfg(windows)]
+    fn check_half_view_binding(displaced_format: u32) {
         use victory_shader::{ResourceType, RootType, UsedResource};
         let Some(host) = crate::host::host() else {
             return;
@@ -1229,7 +1240,7 @@ mod tests {
         let placement = Placement { address: 0, size: 0 };
         assert_eq!(create(desc, placement, &mut heap_ptr), S_OK);
         let heap = heap(heap_ptr);
-        // Two different FLOAT SRVs. The first is read as numbers. The
+        // Two typed SRVs. The first is read as numbers. The
         // displaced one has a NaN payload, a subnormal and negative zero.
         let source = [0xc000_bc00_4000_3c00u64, 0x8000_fc01_03ff_7e01];
         for (i, word) in source.iter().enumerate() {
@@ -1240,6 +1251,9 @@ mod tests {
             resource[4] = 8;
             let mut view = [0; 16];
             view[..3].copy_from_slice(&[10, 1, 5768]);
+            if i == 1 {
+                view[0] = displaced_format;
+            }
             view[6] = 1;
             view[10] = address as u32;
             view[11] = (address >> 32) as u32;
@@ -1261,16 +1275,25 @@ mod tests {
         state.set_heaps(&[heap_ptr]);
         state.set_table(true, 1, heap.start);
         let list = host.new_list().expect("a host list");
-        let fresh = state.tables(&list, &used, &[], &half, true);
-        assert_eq!(fresh.len(), 1);
-        let (root_slot, bytes) = fresh[0];
-        assert_eq!(root_slot, 1);
-        assert_eq!(state.tables(&list, &used, &[], &half, true), fresh);
         let host_heap = heap.host().expect("a host heap");
-        let next = host_heap.dynamic(1).unwrap();
-        host_heap.release(next, 1);
-        let first = bytes / 32;
-        let slots = next - first;
+        let fresh = state.tables(&list, &used, &[], &half, true);
+        let (first, slots) = if displaced_format == 10 {
+            assert_eq!(fresh.len(), 1);
+            let (root_slot, bytes) = fresh[0];
+            assert_eq!(root_slot, 1);
+            assert_eq!(state.tables(&list, &used, &[], &half, true), fresh);
+            let next = host_heap.dynamic(1).unwrap();
+            host_heap.release(next, 1);
+            (bytes / 32, next - bytes / 32)
+        } else {
+            assert!(fresh.is_empty(), "an existing UINT descriptor uses its own slot");
+            (0, host_heap.count())
+        };
+        assert_eq!(
+            state.tables(&list, &used, &[], &[(1, 32)], true),
+            [(1, u32::MAX)],
+            "the shader's requested slot 4 is outside the four-slot heap"
+        );
         let words = if slots >= 3 {
             Some(read_half_table(host, &list, host_heap, first))
         } else {
@@ -1284,9 +1307,11 @@ mod tests {
             crate::shadow::unregister(address as usize, address);
         }
         slot::<extern "system" fn(This) -> u32>(heap_ptr, 0x10)(heap_ptr);
-        assert_eq!(slots, 3, "fresh table must hold the last accessed descriptor");
+        if displaced_format == 10 {
+            assert_eq!(slots, 3, "fresh table must hold the last accessed descriptor");
+        }
         let words = words.unwrap();
-        eprintln!("fresh table readback: FLOAT bits {:x?}, UINT channels {:04x?}", &words[..4], &words[4..]);
+        eprintln!("source format {displaced_format}, slots {slots}: FLOAT bits {:x?}, UINT channels {:04x?}", &words[..4], &words[4..]);
         assert_eq!(words[..4], [1.0f32, 2.0, -1.0, -2.0].map(f32::to_bits));
         assert_eq!(words[4..], [0x7e01, 0x03ff, 0xfc01, 0x8000]);
     }

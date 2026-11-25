@@ -2455,19 +2455,28 @@ impl State {
         }
     }
 
-    fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
-        let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
+    fn table_entry(
+        &self,
+        list: &HostList,
+        slot: u8,
+        dword: u32,
+        kind: Option<ResourceType>,
+        compute: bool,
+    ) {
+        let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
             return;
         };
-        let handle = table + u64::from(u.table_offset_dwords) * 4;
-        let Some(heap) = self.heap_of(handle) else {
+        let Some(heap) = self.heap_of(*table) else {
             return;
         };
+        let handle = table + u64::from(dword) * 4;
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
             return;
         };
         if let Some(view) = host.mirror(index, handle, true) {
-            readable(list, u.kind, &view);
+            if let Some(kind) = kind.or_else(|| view_kind(&view)) {
+                readable(list, kind, &view);
+            }
             // Up to date by this draw: not the texture pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {
                 host.texture_slot_tabled(index, true);
@@ -2524,7 +2533,15 @@ impl State {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
             };
-            let Some(view) = crate::descriptor::view(table + u64::from(at) * 4) else {
+            let Some(heap) = self.heap_of(table) else {
+                continue;
+            };
+            let handle = table + u64::from(at) * 4;
+            if heap.index(handle).is_none() {
+                once!(slot, at, "half-view descriptor outside the bound heap");
+                return vec![(slot, u32::MAX)];
+            }
+            let Some(view) = crate::descriptor::view(handle) else {
                 continue;
             };
             if crate::descriptor::host::half_view(&view).is_some() {
@@ -2541,14 +2558,18 @@ impl State {
         // Tables reaching past a host heap smaller than the title's (the
         // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
         // title's slots there have no host slot of their own.
-        for u in used.iter().filter(tables) {
-            if fresh.contains(&u.slot) {
+        let declared = used.iter().filter(tables).map(|u| (u.slot, u.table_offset_dwords));
+        let extra: Vec<_> = half.iter().copied()
+            .filter(|&place| !declared.clone().any(|entry| entry == place))
+            .collect();
+        for (slot, at) in declared.chain(extra.iter().copied()) {
+            if fresh.contains(&slot) {
                 continue;
             }
-            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
+            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
             };
-            let end = table + u64::from(u.table_offset_dwords) * 4;
+            let end = table + u64::from(at) * 4;
             let Some(heap) = self.heap_of(table) else {
                 continue;
             };
@@ -2556,14 +2577,21 @@ impl State {
                 continue;
             };
             if index >= host.count() {
-                fresh.push(u.slot);
+                fresh.push(slot);
             }
         }
         fresh.sort_unstable();
         fresh.dedup();
         for u in used.iter().filter(tables) {
             if !fresh.contains(&u.slot) {
-                self.table_entry(list, u, compute);
+                self.table_entry(list, u.slot, u.table_offset_dwords, Some(u.kind), compute);
+            }
+        }
+        // Already-unsigned non-base views can use their original host slot,
+        // but their backing memory still needs the usual refresh or writeback.
+        for &(slot, at) in &extra {
+            if !fresh.contains(&slot) {
+                self.table_entry(list, slot, at, None, compute);
             }
         }
         let mut made = Vec::new();
@@ -2598,6 +2626,7 @@ impl State {
                     // The shader adds i32 byte offsets and shifts by 5.
                     index.byte_offset.wrapping_add(constant << index.shift) / 32
                 })
+                .chain(extra.iter().filter(|&&(root, _)| root == slot).map(|&(_, at)| at / 8))
                 .collect();
             selected.sort_unstable();
             selected.dedup();
@@ -2613,6 +2642,9 @@ impl State {
                 || last.and_then(|handle| heap.index(handle)).is_none()
             {
                 once!(slot, n, "fresh descriptor table exceeds the available span");
+                if half.iter().any(|&(root, _)| root == slot) {
+                    made.push((slot, u32::MAX));
+                }
                 continue;
             }
             // The table and what its entries hold (record words).
