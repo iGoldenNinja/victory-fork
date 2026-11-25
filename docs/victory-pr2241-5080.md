@@ -23,3 +23,9 @@ I ran `translate --jobs 2 --validate --pipelines --list` on the same 169 inputs 
 | PR head `e2624b3` | 162 of 168 | 162 | 162 | 6 × `barycentrics read directly` |
 
 All 162 emitted programs validated and created an offline D3D12 pipeline. The six remaining programs passed I/O analysis before being refused when lowering direct reads of barycentrics. Synthetic fixtures reached GPU execution and readback. The matched pixel programs reached pipeline creation, so the effects on gameplay rendering and frame rate remain unverified.
+
+## Combined retest with PR 453
+
+PR 453 adds DXIL `SV_Barycentrics` inputs for shaders that read those values directly. I applied the exact PR 2241 commit to clean PR 453 head `88b34a447350eeb1e747be84e4204dbb3955c58c`. The changes combined without manual edits. I rebuilt with the same toolchain and reran the six remaining programs on the same RTX 5080. All six emitted, validated and created D3D12 test pipelines. [Barycentric lowering](https://github.com/Marvisak/VIctory/pull/453)
+
+The full retest used the same 169 inputs, with one duplicate. All **168 unique pixel programs** emitted, validated and created D3D12 test pipelines, including the 162 that had worked with PR 2241 alone. The two branches share the older `ffe310e` base. The combined build establishes offline pipeline coverage for this set. Gameplay output remains unverified.
