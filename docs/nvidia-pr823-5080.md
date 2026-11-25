@@ -33,3 +33,23 @@ I started the PR in the Series X profile with the default relay, readback, ray-t
 Both builds reached controllable prison and neither logged device removal. The first pan matched within 36 ms after player selection, with later inputs matching within 20 ms relative to the pan. Blocky tiles below the courtyard window remained visible in two stationary captures around 25 seconds apart on PR 823. At the comparable post-retreat view, the ceiling and walls drew in both builds and the stepped character edge remained. The PR view showed additional lit detail on the divider and floor in that capture.
 
 The live comparison uses one run per revision, with differing startup shader-cache behavior and draw counts. It measures the full PR, which also changes page mapping. The observed FPS difference does not isolate the cost of the four compute programs.
+
+## Same-build allowlist comparison
+
+I reused the enabled run above and repeated the same 90-second Series X prison replay on the identical `aaf658a` executable with `VICTORY_WAVE_WIDE_ONLY=none`. Both starts used separate, byte-matched copies of the same 3,067 cache seed files and the same host pipeline library. Both had zero startup shader-cache hits. Relay, readback, the builder, and the PR's page-mapping code were fixed across the two runs. The enabled run came first.
+
+| 90-second prison replay | Allowlist enabled | Allowlist disabled |
+| --- | ---: | ---: |
+| Targeted compute pipelines created | 4/4 | 0/4 |
+| Unique D3D12 pipeline refusals | 4 | 8 |
+| Displayed application frames | 268 | 325 |
+| Displayed application FPS | 2.97 | 3.59 |
+| P99 displayed frame time | 552.72 ms | 517.43 ms |
+| Worst displayed frame time | 593.89 ms | 605.65 ms |
+| Mean GPU busy per displayed frame | 209.17 ms | 201.10 ms |
+| Median reported draws per frame | 6,627.5 | 5,610 |
+
+With the allowlist disabled, the four targeted programs returned `E_INVALIDARG`. Both runs reached controllable prison and finished the route without a logged device removal. The first pan matched within 12 ms of player selection and later input offsets matched within 25 ms. Both runs logged 405 startup shader-cache misses and 3,058 misses at the last tally, with zero hits.
+
+Blocky tiles below the courtyard window and stepped character edges were visible in both settings. With the allowlist enabled, the comparable post-retreat view showed more lit detail on the divider and floor. The timing and draw counts describe this replay pair. Each setting was run once, in fixed order.
+
