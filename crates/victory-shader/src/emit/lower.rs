@@ -9707,7 +9707,10 @@ impl<'a> Lower<'a> {
             if kind == 5 && (*unorm || op == 81) {
                 return Err("a cube sample with texel coordinates or a level query");
             }
-            for (k, slot) in cs.iter_mut().enumerate().take(coords) {
+            // calculateLOD takes spatial coordinates only; the array slice
+            // occupies an unused DXIL operand and must stay undefined.
+            let coordinate_count = if op == 81 { spatial } else { coords };
+            for (k, slot) in cs.iter_mut().enumerate().take(coordinate_count) {
                 let x = addr_packed(self, coord_base, k)?;
                 *slot = to_float(self, x);
             }
