@@ -1289,11 +1289,15 @@ mod tests {
             assert!(fresh.is_empty(), "an existing UINT descriptor uses its own slot");
             (0, host_heap.count())
         };
-        assert_eq!(
-            state.tables(&list, &used, &[], &[(1, 32)], true),
-            [(1, u32::MAX)],
-            "the shader's requested slot 4 is outside the four-slot heap"
-        );
+        // The final dword and the first byte past this heap are both
+        // invalid starts for a view descriptor.
+        for dword in [31, 32] {
+            assert_eq!(
+                state.tables(&list, &used, &[], &[(1, dword)], true),
+                [(1, u32::MAX)],
+                "dword {dword} is not a descriptor slot"
+            );
+        }
         let words = if slots >= 3 {
             Some(read_half_table(host, &list, host_heap, first))
         } else {

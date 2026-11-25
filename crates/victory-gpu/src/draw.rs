@@ -2537,8 +2537,8 @@ impl State {
                 continue;
             };
             let handle = table + u64::from(at) * 4;
-            if heap.index(handle).is_none() {
-                once!(slot, at, "half-view descriptor outside the bound heap");
+            if heap.samplers() || heap.index(handle).and_then(|index| heap.handle(index)) != Some(handle) {
+                once!(slot, at, "half-view address is not a slot of the bound view heap");
                 return vec![(slot, u32::MAX)];
             }
             let Some(view) = crate::descriptor::view(handle) else {
