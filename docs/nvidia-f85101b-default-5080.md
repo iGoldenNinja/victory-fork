@@ -19,3 +19,20 @@ Both reached controllable prison, with the same eight distinct pipeline refusals
 
 The timings describe one run per revision, in fixed order. They measure the defaults together. Individual switch effects and run-to-run variance remain to be measured.
 
+## Dedicated copy-queue fetches
+
+I repeated the route on the identical `f85101b` executable with `VICTORY_QUEUE2=1`, using a fresh verified copy of the same cache seed. The earlier `f85101b` default arm ran first. Both had 2,124 startup shader-cache hits and zero misses at the first tally. The effective relay mode was 2 in both. Async submission, indirect draw windows and the earlier in-flight fetch switch were all left at defaults. The first pan matched within 90 ms from player selection and later inputs within 26 ms from the pan.
+
+| 90-second prison replay | Default | Dedicated copy queue |
+| --- | ---: | ---: |
+| Displayed application frames | 349 | 309 |
+| Displayed FPS | 3.86 | 3.41 |
+| P99 displayed frame time | 376.31 ms | 540.96 ms |
+| Mean GPU busy per displayed frame | 195.54 ms | 230.36 ms |
+| Median relay fetch wait | 131.20 ms | 11.00 ms |
+| Median copy-back in host telemetry | 170.90 ms | 79.60 ms |
+| Median reported draws per frame | 5,845 | 5,901 |
+
+The queue reported a median 14.5 readback jobs transferring 74.9 MiB per frame over 77 samples. Upload jobs on the copy queue stayed at zero. The relay also reported a median 59.8 pieces per frame fetched again at their own landing. Both runs reached controllable prison and showed the same eight distinct pipeline refusals, with zero logged device removals. The blocky band below the courtyard window and stepped character edges appeared in both settings. The post-retreat frames showed similar room geometry and lighting.
+
+The copy-queue run had much shorter fetch waits and copy-back time, alongside higher GPU busy time and worse displayed frame pacing. Each setting ran once, in fixed order.
