@@ -222,6 +222,12 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             dst_args.Store3(records * stride + dst_at, uint3(rest, groups.yz));
         }
         dst_args.Store3(dst_at, groups);
+        // Diagnostics only. The host reserves one extra triplet beyond the
+        // single dispatch's output record(s) for the input seen by this clamp.
+        if (kind == 2 && (has_count & 8u) != 0) {
+            uint trace_at = ((has_count & 4u) != 0 ? 2u : 1u) * stride;
+            dst_args.Store3(trace_at, src_args.Load3(src_at));
+        }
         for (uint off = 12; off < stride; off += 4) {
             dst_args.Store(dst_at + off, src_args.Load(src_at + off));
         }
@@ -412,7 +418,9 @@ fn clamp_into(
     ahead_split: (bool, bool),
 ) -> bool {
     let before = list.indirect_state(dst);
-    let recorded = record_clamp_with(c, &list.list, (dst, before), budget, src, count, spec, ahead_split);
+    let (ahead, split) = ahead_split;
+    let flags = (u32::from(ahead) << 1) | (u32::from(split) << 2);
+    let recorded = record_clamp_with(c, &list.list, (dst, before), budget, src, count, spec, flags);
     if recorded {
         list.indirect_readable(dst);
     }
@@ -435,11 +443,10 @@ fn record_clamp_as(
     spec: (u32, u32, u32),
     ahead: bool,
 ) -> bool {
-    record_clamp_with(c, l, (dst, before), budget, src, count, spec, (ahead, false))
+    record_clamp_with(c, l, (dst, before), budget, src, count, spec, u32::from(ahead) << 1)
 }
 
-/// [`record_clamp_as`]; `split`: dispatch records' groups past 65,535 in x
-/// go to second records after the first ([`bound_split`]).
+/// [`record_clamp_as`] with optional split dispatch and diagnostic readback.
 #[allow(clippy::too_many_arguments)]
 fn record_clamp_with(
     c: &Clamp,
@@ -449,7 +456,7 @@ fn record_clamp_with(
     (src, src_offset): (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
-    (ahead, split): (bool, bool),
+    flags: u32,
 ) -> bool {
     let Some(bytes) = validate_layout(
         (kind, stride, records),
@@ -494,8 +501,7 @@ fn record_clamp_with(
         }
         None => (src_gpu, 0u32, 0u32),
     };
-    let flags = has_count | (u32::from(ahead) << 1) | (u32::from(split) << 2);
-    let constants = [kind, stride, records, args_offset, flags, count_offset];
+    let constants = [kind, stride, records, args_offset, has_count | flags, count_offset];
     // SAFETY: an open list; our root signature and pipeline; live source,
     // count, scratch destination, and budget buffers. `src` and `count` stay
     // in `COMMON` / `GENERIC_READ` via implicit buffer promotion while `dst`
@@ -539,6 +545,91 @@ fn record_clamp_with(
         l.ResourceBarrier(&second[skip..]);
     }
     true
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn trace_hash(hash: &str) -> Option<u64> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static HASH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let selected = HASH.get_or_init(|| std::env::var("VICTORY_TRACE_INDIRECT").ok());
+    if selected.as_deref() != Some(hash) {
+        return None;
+    }
+    let sample = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    sample.is_multiple_of(16).then_some(sample)
+}
+
+/// Samples an uncounted one-record dispatch at the point where the clamp
+/// consumes it. Read the result only after the host list's fence completes.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn bound_traced_dispatch(
+    list: &HostList,
+    src: (&ID3D12Resource, u64),
+    stride: u32,
+    split: bool,
+    sample: u64,
+) -> Option<ID3D12Resource> {
+    let spec = (2, stride, 1);
+    let bytes = validate_layout(spec, src.1, None)?;
+    let trace_at = bytes * if split { 2 } else { 1 };
+    let needed = trace_at.checked_add(12).filter(|&n| n <= u64::from(u32::MAX))?;
+    let readback = host()?.read_back_buffer(36)?;
+    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(needed)?);
+    let before = list.indirect_state(&dst);
+    let flags = (u32::from(split) << 2) | 8;
+    if !record_clamp_with(c, &list.list, (&dst, before), budget, src, None, spec, flags) {
+        return None;
+    }
+    let indirect = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+    let copy = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    // SAFETY: the clamp just wrote the records and left the scratch in
+    // INDIRECT_ARGUMENT. Restore that state before the title's execution.
+    unsafe {
+        let commands = &list.list;
+        commands.ResourceBarrier(&[transition(&dst, indirect, copy)]);
+        commands.CopyBufferRegion(&readback, 0, &dst, trace_at, 12);
+        commands.CopyBufferRegion(&readback, 12, &dst, 0, 12);
+        if split {
+            commands.CopyBufferRegion(&readback, 24, &dst, bytes, 12);
+        }
+        commands.ResourceBarrier(&[transition(&dst, copy, indirect)]);
+    }
+    list.indirect_readable(&dst);
+    list.defer_indirect_trace(DispatchTrace {
+        readback,
+        sample,
+        frame: crate::frame::current(),
+        split,
+    });
+    Some(dst)
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) struct DispatchTrace {
+    readback: ID3D12Resource,
+    sample: u64,
+    frame: u64,
+    split: bool,
+}
+
+#[cfg(feature = "diagnostics")]
+impl DispatchTrace {
+    pub(crate) fn report(&self) {
+        let mut data = std::ptr::null_mut();
+        // SAFETY: the completed host list wrote every triplet read here.
+        unsafe {
+            if self.readback.Map(0, None, Some(&mut data)).is_err() || data.is_null() {
+                return;
+            }
+            let data = data.cast::<[u32; 3]>();
+            let asked = data.read();
+            let first = data.add(1).read();
+            let second = if self.split { data.add(2).read() } else { [0; 3] };
+            self.readback.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
+            tracing::info!(sample = self.sample, frame = self.frame, split = self.split, ?asked, ?first, ?second, "indirect dispatch trace");
+        }
+    }
 }
 
 /// Whether every draw served from a window is checked against a fresh
@@ -1449,7 +1540,7 @@ void main(uint3 g : SV_GroupID) {
             (&src_buf, 0),
             None,
             (2, STRIDE, 1),
-            (false, split),
+            u32::from(split) << 2,
         ));
         // SAFETY: an open list, the worker's root signature and pipeline,
         // live buffers; the scratch buffer is in `INDIRECT_ARGUMENT`.
@@ -1516,6 +1607,46 @@ void main(uint3 g : SV_GroupID) {
         assert!(hits[..65_535].iter().all(|&h| h == 1));
         assert!(hits[65_535..].iter().all(|&h| h == 0));
         assert_eq!(spent, 65_535 * 64);
+    }
+
+    #[test]
+    fn warp_dispatch_trace_preserves_the_requested_triplet() {
+        let mut warp = WarpHarness::new().expect("WARP is required for the dispatch trace fixture");
+        const STRIDE: u32 = 16;
+        let request = [89_968u32, 2, 1];
+        for split in [false, true] {
+            let trace_at = u64::from(STRIDE) * if split { 2 } else { 1 };
+            let (src, input, _) = warp.shared_buffer(u64::from(STRIDE));
+            let (_budget, budget_data, budget_gpu) = warp.shared_buffer(256);
+            let dst = warp.default_uav(trace_at + 12);
+            let (readback, output, _) = warp.shared_buffer(trace_at + 12);
+            // SAFETY: the mappings cover the input record and budget word.
+            unsafe {
+                input.cast::<[u32; 3]>().write(request);
+                budget_data.cast::<u32>().write(0);
+            }
+            assert!(record_clamp_with(
+                &warp.clamp, &warp.list, (&dst, D3D12_RESOURCE_STATE_COMMON), budget_gpu,
+                (&src, 0), None, (2, STRIDE, 1), 8 | (u32::from(split) << 2),
+            ));
+            // SAFETY: the clamp left the scratch readable for indirect
+            // arguments, and both resources hold the requested range.
+            unsafe {
+                warp.list.ResourceBarrier(&[transition(
+                    &dst, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                warp.list.CopyBufferRegion(&readback, 0, &dst, 0, trace_at + 12);
+            }
+            warp.submit_and_wait();
+            // SAFETY: the fence finished and the readback contains each record.
+            unsafe {
+                assert_eq!(output.cast::<[u32; 3]>().read(), [65_535, 2, 1]);
+                if split {
+                    assert_eq!(output.add(STRIDE as usize).cast::<[u32; 3]>().read(), [24_433, 2, 1]);
+                }
+                assert_eq!(output.add(trace_at as usize).cast::<[u32; 3]>().read(), request);
+            }
+        }
     }
 
     /// WARP D3D12 test proving `BUDGET` saturates without 32-bit unsigned

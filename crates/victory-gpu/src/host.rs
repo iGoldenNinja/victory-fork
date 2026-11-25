@@ -1847,6 +1847,8 @@ struct Deferred {
     /// memory they go to, the bytes of a row, the rows, the title's row
     /// pitch.
     backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
+    #[cfg(feature = "diagnostics")]
+    indirect_traces: Vec<crate::indirect::DispatchTrace>,
     /// Whether the indirect-work budget is zeroed for this recording (a
     /// step on the CPU, or in the list for the card's copy).
     budget_zeroed: bool,
@@ -3496,7 +3498,12 @@ pub(crate) fn walls_trace() -> bool {
 /// without it, so the title read a buffer nobody wrote, as before read-backs
 /// were made (the exposure metering's two small float targets, every frame).
 fn read_backs(list: &HostList) {
-    for (buffer, at, [row, rows, pitch]) in &list.deferred().backs {
+    let deferred = list.deferred();
+    #[cfg(feature = "diagnostics")]
+    for trace in &deferred.indirect_traces {
+        trace.report();
+    }
+    for (buffer, at, [row, rows, pitch]) in &deferred.backs {
         let mut data = std::ptr::null_mut();
         // SAFETY: a read-back buffer of ours, written by the list that has
         // run; the title's destination holds every row (checked when the
@@ -6299,6 +6306,11 @@ impl HostList {
     /// the list is reset.
     pub(crate) fn defer_read_back(&self, buffer: ID3D12Resource, dst: *mut u8, [row, rows, pitch]: [usize; 3]) {
         self.deferred().backs.push((buffer, dst as usize, [row, rows, pitch]));
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn defer_indirect_trace(&self, trace: crate::indirect::DispatchTrace) {
+        self.deferred().indirect_traces.push(trace);
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.

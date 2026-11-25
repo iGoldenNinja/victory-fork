@@ -3036,14 +3036,28 @@ impl State {
                 // own and copies clamped active records into a scratch
                 // buffer at offset 0.
                 let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
+                if let Some(base) = group_base {
+                    second = Some((base, u64::from(step) * u64::from(records)));
+                }
+                #[cfg(feature = "diagnostics")]
+                let trace_sample = (kind == DISPATCH && records == 1 && count_arg.is_none())
+                    .then(|| crate::indirect::trace_hash(&p.stages[0].shader.hash))
+                    .flatten();
+                #[cfg(feature = "diagnostics")]
+                let traced = trace_sample.and_then(|sample| {
+                    crate::indirect::bound_traced_dispatch(list, (&args.buffer, offset), step, group_base.is_some(), sample)
+                });
+                #[cfg(not(feature = "diagnostics"))]
+                let traced = None;
                 // More than the record asked for: a window clamped ahead,
                 // whose unfilled slots must not spend the list's budget.
-                let bounded = if windowed && records > 1 {
+                let bounded = if traced.is_some() {
+                    traced
+                } else if windowed && records > 1 {
                     crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
-                } else if let Some(base) = group_base {
+                } else if group_base.is_some() {
                     // The groups past 65,535 in x run as second records,
                     // `records` records on in the scratch buffer.
-                    second = Some((base, u64::from(step) * u64::from(records)));
                     crate::indirect::bound_split(list, (&args.buffer, offset), count_arg, (kind, step, records))
                 } else {
                     crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
