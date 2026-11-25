@@ -25,3 +25,11 @@ Same computer, SATA SSD, Series X, and DRED. This second run reused the cache wa
 PresentMon captured 1,085 displayed application frames over 300.069 s. Average 3.612 FPS, P99 664.398 ms, worst interval 1,017.174 ms, and mean GPU busy time 195.05 ms per displayed interval. During several room samples the parallel copy-back thread reported approximately 180–215 ms per frame. These timing fields overlap. Both five-minute captures missed the 30 FPS gameplay target.
 
 The four earlier wave64 cases also reproduced rejection in an offline host compute PSO creation check on this revision. All four compiled and passed DXIL validation. None created a PSO. Both title runs reached player control with no D3D12 device-removal message in the logs.
+
+## Five-minute comparison on NVIDIA fork `310c6eb`
+
+On the same RTX 5080, driver 617.14, Windows 11 Pro 26200, SATA SSD and Series X profile, `310c6eb6c16822ab95076aad61fce19bba86bb98` reached the prison with working camera and movement through the existing diagnostics replay. DRED was enabled. The run used a warmed cache and five timed forward and backward movements in the same room. Camera angles and draw counts differed from the earlier run.
+
+PresentMon captured 1,264 application frames over 300.105 seconds, averaging **4.209 FPS** with **417.475 ms P99** and **523.282 ms worst**. Mean GPU busy time was 182.73 ms per displayed interval. For comparison, `c96b4f2` averaged 3.612 FPS with 664.398 ms P99. Across 54 runtime timing samples per run, the copy-back thread's median reported time was 175.25 ms per frame on `310c6eb` and 180.65 ms on `c96b4f2`. GPU and copy-back time overlap. The camera path and cache history prevent assigning the change to a specific commit or pass.
+
+Strong lighting and pixel artifacts remained visible. DRED did not report device removal, and the run ended deliberately after measurement. Title-process PCM was present. Audio synchronization, normal game speed and story progression beyond this room remain unmeasured. The opening sequence still refused the four previously sampled compute PSOs. [ZTRX barrier comparison on the same four inputs](https://github.com/iGoldenNinja/victory-fork/blob/f31b723185efcfac8fb9bebf7a6e0463ec581850/docs/ztrx-wave32-barriers-5080.md)
