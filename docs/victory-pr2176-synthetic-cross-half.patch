@@ -29,17 +29,15 @@
          }),
          code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
      };
-@@ -281,6 +285,45 @@
+@@ -281,6 +285,75 @@
          panic!("translated a gather at a level read from memory");
      };
      assert_eq!(what, "a gather at a level that may not be whole");
 +}
 +
 +#[test]
-+fn wave64_host32_reads_logical_lane_32() {
-+    let host = Host::new(false).expect("D3D12 hardware adapter");
-+    super::set_host_wave32(true);
-+    let lowered = build_for_group(&[
++fn wave64_host32_bpermute_stays_inside_each_half() {
++    let output = dispatch_host32_fixture(&[
 +        0xBE84_0300, // s_mov_b32 s4, s0
 +        0xBE85_0380, // s_mov_b32 s5, 0
 +        0xF408_0A02,
@@ -56,7 +54,40 @@
 +        0xE070_1000,
 +        0x800A_0310, // buffer_store_dword v3, v16, s[40:43], 0 offen
 +        0xBF81_0000, // s_endpgm
-+    ], true, 64);
++    ]);
++    let expected: Vec<u32> = (0..64).map(|lane| 1000 + (lane & 32)).collect();
++    println!("bpermute lane 0={}, lane 32={}", output[0], output[32]);
++    assert_eq!(output, expected);
++}
++
++#[test]
++fn wave64_host32_readlane_uses_the_whole_guest_wave() {
++    let mut actual = Vec::new();
++    for (lane, operand) in [(5, 0x0001_0B00), (32, 0x0001_4100)] {
++        let output = dispatch_host32_fixture(&[
++            0xBE84_0300, // s_mov_b32 s4, s0
++            0xBE85_0380, // s_mov_b32 s5, 0
++            0xF408_0A02,
++            0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
++            0xD760_000C,
++            operand, // v_readlane_b32 s12, v0, lane
++            0x7E06_020C, // v_mov_b32 v3, s12
++            0x3420_0082, // v_lshlrev_b32 v16, 2, v0
++            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
++            0xE070_1000,
++            0x800A_0310, // buffer_store_dword v3, v16, s[40:43], 0 offen
++            0xBF81_0000, // s_endpgm
++        ]);
++        println!("readlane select={lane} lower={} upper={}", output[0], output[32]);
++        actual.push(output);
++    }
++    assert_eq!(actual, [vec![5; 64], vec![32; 64]], "v_readlane_b32 selects a lane in the entire guest wave");
++}
++
++fn dispatch_host32_fixture(words: &[u32]) -> Vec<u32> {
++    let host = Host::new(false).expect("D3D12 hardware adapter");
++    super::set_host_wave32(true);
++    let lowered = build_for_group(words, true, 64);
 +    super::set_host_wave32(false);
 +    let mut shader = lowered.expect("lower wave64 fixture");
 +    let mut validator = validator::Validator::load(validator::Validator::default_path().as_deref())
@@ -70,8 +101,7 @@
 +    let output = host.dispatch(&root, &pso, &Dispatch {
 +        roots: vec![(0, Root::Constants(ud))], views: &views, samplers: &[], groups: [1, 1, 1],
 +    }).expect("dispatch and read back");
-+    println!("logical lane 32 value=1032 output_lane_0={} output_lane_32={}", output[0][0], output[0][32]);
-+    assert_eq!(output[0], vec![1032; 64], "all lanes must read the guest wave's lane 32");
++    output.into_iter().next().expect("UAV output")
  }
  
  #[test]
