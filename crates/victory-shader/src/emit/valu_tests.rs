@@ -1635,8 +1635,19 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
 /// moves no halves names nothing.
 #[test]
 fn halves_go_through_a_table_as_they_are_and_name_their_views() {
+    check_half_table(0);
+}
+
+#[test]
+fn halves_read_a_float_view_inside_a_descriptor_range() {
+    check_half_table(32);
+}
+
+fn check_half_table(input_byte: u32) {
     use super::host::Stride;
-    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_UINT;
+    use windows::Win32::Graphics::Dxgi::Common::{
+        DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16B16A16_UINT,
+    };
     /// MUBUF `op vdata, vaddr, s[srsrc:srsrc+3], 0 idxen`.
     const fn mubuf_idxen(op: u32, vdata: u8, vaddr: u8, srsrc: u8) -> [u32; 2] {
         [
@@ -1647,11 +1658,14 @@ fn halves_go_through_a_table_as_they_are_and_name_their_views() {
     const LOAD_D16_XYZW: u32 = 0x83;
     const STORE_D16_XYZW: u32 = 0x87;
     const THREADS: u32 = 32;
-    // The table's second descriptor, 0x20 bytes on.
+    // The SRV range begins at zero; the UAV follows the accessed descriptor.
+    let output_byte = input_byte + 32;
+    let mut first = s_load_dwordx4(8, 4);
+    first[1] |= input_byte;
     let mut second = s_load_dwordx4(12, 4);
-    second[1] |= 0x20;
+    second[1] |= output_byte;
     let mut words = vec![s_mov_b32(5, 0x80)];
-    words.extend_from_slice(&s_load_dwordx4(8, 4));
+    words.extend_from_slice(&first);
     words.extend_from_slice(&second);
     // v[1:2] = first[thread] (four halves), second[thread] = v[1:2].
     words.extend_from_slice(&mubuf_idxen(LOAD_D16_XYZW, 1, 0, 8));
@@ -1689,7 +1703,10 @@ fn halves_go_through_a_table_as_they_are_and_name_their_views() {
                 slot: 1,
             },
         ],
-        used: vec![view(ResourceType::Srv, 0), view(ResourceType::Uav, 8)],
+        used: vec![
+            view(ResourceType::Srv, 0),
+            view(ResourceType::Uav, output_byte / 4),
+        ],
         io: StageIo::Cs(ComputeIo {
             rsrc2: 5 << 1,
             threads: [THREADS, 1, 1],
@@ -1713,7 +1730,6 @@ fn halves_go_through_a_table_as_they_are_and_name_their_views() {
         mesh_stride: 0,
     })
     .expect("lower");
-    assert_eq!(lowered.half_views, [(1, 0), (1, 8)]);
     let shader = HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
@@ -1750,8 +1766,32 @@ fn halves_go_through_a_table_as_they_are_and_name_their_views() {
         .chunks(2)
         .map(|pair| u32::from(pair[0]) | u32::from(pair[1]) << 16)
         .collect();
+    // Simulate a table of FLOAT descriptors. Only the slots named by
+    // lowering receive the unsigned view, as in the draw-time binding.
+    let sentinel = vec![0xdead_beef; data.len()];
+    let mut views = Vec::new();
+    for slot in 0..=input_byte / 32 {
+        let format = if shader.half_views.contains(&(1, slot * 8)) {
+            DXGI_FORMAT_R16G16B16A16_UINT
+        } else {
+            DXGI_FORMAT_R16G16B16A16_FLOAT
+        };
+        views.push(View::Buffer {
+            data: if slot * 32 == input_byte {
+                &data
+            } else {
+                &sentinel
+            },
+            stride: Stride::Format(format, 8),
+        });
+    }
+    views.push(if shader.half_views.contains(&(1, output_byte / 4)) {
+        View::HalfUintUav(THREADS)
+    } else {
+        View::HalfUav(THREADS)
+    });
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    let mut ran = 0;
+    let mut results = Vec::new();
     for (label, warp) in [("hardware", false), ("warp", true)] {
         let Ok(host) = Host::new(warp) else {
             eprintln!("no SM 6.6 {label} device; skipped");
@@ -1773,25 +1813,33 @@ fn halves_go_through_a_table_as_they_are_and_name_their_views() {
                 &pso,
                 &Dispatch {
                     roots: vec![(0, Root::Constants(ud))],
-                    views: &[
-                        View::Buffer {
-                            data: &data,
-                            stride: Stride::Format(DXGI_FORMAT_R16G16B16A16_UINT, 8),
-                        },
-                        View::HalfUintUav(THREADS),
-                    ],
+                    views: &views,
                     samplers: &[],
                     groups: [1, 1, 1],
                 },
             )
             .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
-        assert_eq!(
-            out[0], data,
-            "{label}: the halves stored are the halves loaded"
+        assert_eq!(out[0].len(), data.len());
+        let matches = out[0]
+            .iter()
+            .flat_map(|&word| [word as u16, (word >> 16) as u16])
+            .zip(&halves)
+            .filter(|(got, want)| got == *want)
+            .count();
+        eprintln!(
+            "{label}: SRV byte {input_byte}, half views {:?}, {matches}/{} half words preserved",
+            shader.half_views, halves.len()
         );
-        ran += 1;
+        results.push((label, matches));
     }
-    assert!(ran > 0, "no SM 6.6 device available");
+    assert!(!results.is_empty(), "no SM 6.6 device available");
+    assert_eq!(
+        shader.half_views,
+        [(1, input_byte / 4), (1, output_byte / 4)]
+    );
+    for (label, matches) in results {
+        assert_eq!(matches, halves.len(), "{label}: preserved half words");
+    }
 }
 
 /// The places a program that moves halves names are the descriptors it
