@@ -1162,3 +1162,88 @@ fn an_allocation_in_units_of_a_size_is_the_idiom() {
     assert_eq!(idiom(&program(5)), Ok(()));
     assert!(idiom(&program(2)).is_err(), "the count as the base");
 }
+
+/// A masked Wave64 reserving output slots while other groups contend for the same counter.
+/// Each accepted lane writes an independently identifiable value. The order of groups is free.
+#[test]
+fn masked_append_has_no_holes_when_groups_share_a_counter() {
+    let mut body = vec![
+        vop2(0x1a, 10, k(6), 8),   // v10 = group x * 64
+        vop2(0x25, 10, v(0), 10),  // add the thread index
+        vop2(0x25, 10, k(1), 10),  // make zero an unwritten sentinel
+        vop2(0x1d, 7, 2, 0),       // permute the active lanes with s2
+        vopc(0xc4, 0, 7),          // s0 > v7
+        sop1(0x24, 12, VCC),       // save EXEC and activate the selected lanes
+    ];
+    let skip = body.len();
+    body.push(0);
+    body.extend([
+        sop1(0x04, 2, 126),        // s2:s3 = EXEC
+        sop1(0x14, 4, 126),        // first selected lane
+    ]);
+    body.extend(vop3(0x365, 4, 193, k(0)));
+    body.extend(vop3(0x366, 4, 193, v(4))); // v4 = absolute lane
+    body.extend([
+        sop1(0x04, 6, 126), 0x7da4_0804, // elect that lane
+        sop1(0x10, 2, 2),                // selected lane count
+        vop1(0x01, 5, 2), vop1(0x01, 11, k(0)),
+        0xe0c8_5000, 0x8002_050b,         // raw atomic at byte offset zero; v5 receives the base
+        sop1(0x04, 126, 6),
+    ]);
+    body.extend(vop3(0x365, 4, 126, k(0)));
+    body.extend(vop3(0x366, 4, 127, v(4))); // v4 = selected predecessors
+    body.extend([
+        0x7e0a_0505,                         // broadcast v5 from the first selected lane
+        vop2(0x25, 6, 5, 4),                 // base + predecessors
+        vop2(0x1a, 15, k(2), 6),
+    ]);
+    body.extend(store(10, 15, 4));
+    body[skip] = sopp(8, (body.len() - skip - 1) as i16);
+    body.push(sop1(0x04, 126, 12));
+
+    let mut native = native(&body);
+    let StageIo::Cs(ref mut cs) = native.io else { unreachable!() };
+    cs.rsrc2 |= 1 << 7; // group x in s5, before the standard fixture's descriptor prologue
+    native.code.splice(0..0, vop1(0x01, 8, 5).to_le_bytes());
+    let p = ir::build(&native.code, true, native.vgprs).unwrap();
+    let bytes = crate::dxbc::build(&[]);
+    let container = super::Container::parse(&bytes).unwrap();
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let result = super::widen(&container, &native, &p, false);
+    lower::TEST_HOST_WAVE.set(was);
+    let (shader, wave) = result.expect("translate the masked append");
+    assert_eq!(wave, Some(32));
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else { eprintln!("no hardware device for masked append"); return };
+    let Ok((root, pipeline)) = host.compute_pipeline(&shader) else {
+        eprintln!("hardware does not accept the translated Wave32 append"); return;
+    };
+    const GROUPS: u32 = 240;
+    let mut verified = 0;
+    for (threshold, permutation) in [(0, 0), (1, 0), (1, 63), (17, 21), (32, 32),
+                                     (33, 37), (47, 63), (63, 1), (64, 0)] {
+        let expected: Vec<u32> = (0..GROUPS * 64)
+            .filter(|id| (id % 64 ^ permutation) < threshold).map(|id| id + 1).collect();
+        let constants = [threshold, 1, permutation, 0];
+        let mut ud = vec![0; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            if let (RootType::Constants, 0, d @ 0..=3) = (u.root, u.slot, u.dword) {
+                ud[u.index as usize] = constants[d as usize];
+            }
+        }
+        for _ in 0..4 {
+            let got = host.dispatch(&root, &pipeline, &Dispatch {
+                roots: vec![(0, Root::Constants(ud.clone()))],
+                views: &[View::RawUav(GROUPS * 64 + 1)],
+                samplers: &[], groups: [GROUPS,1,1],
+            }).expect("execute the compacting dispatch").remove(0);
+            assert_eq!(got[0] as usize, expected.len(), "counter for {threshold}/{permutation}");
+            let mut filled = got[1..1+expected.len()].to_vec();
+            filled.sort_unstable();
+            assert!(filled == expected, "missing or repeated item for {threshold}/{permutation}");
+            assert!(got[1+expected.len()..].iter().all(|value| *value == 0), "tail changed");
+            verified += 1;
+        }
+    }
+    eprintln!("masked append verified {verified} hardware dispatches of {GROUPS} groups");
+}
