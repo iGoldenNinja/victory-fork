@@ -1,6 +1,8 @@
-# RTX 5080 buffer hashing at the boat helm
+# RTX 5080 buffer hashing at the boat helm and in the prison cell
 
 Wide hashing reduced the stationary GPU time for storing and comparing host-buffer hashes from 48.0–48.2 ms per frame to 6.4–6.5 ms. Stationary displayed FPS rose by 20.3% in the first pair and 23.7% in the reverse pair. Under throttle the gains were 24.5% and 15.8%. Moving P99 improved in the first pair and worsened in the reverse pair. The cloudy, smooth-water appearance in the first wide trial did not repeat in the second wide trial. The normal gameplay launcher continues to use the verified water repair.
+
+A separate prison-cell pair increased displayed FPS from 3.204 to 3.696 (+15.4%). The same character, barred window, wall and bunk were visible in both runs. The results support the reduction in GPU hash cost in two gameplay scenes. Moving frame-time tails and the occasional smooth-water state still need controlled repeats before a default switch.
 
 ## Boat measurements
 
@@ -29,6 +31,19 @@ The boat stayed afloat and left wakes in all four replays. In the 43 stationary 
 The first wide trial had clouds, broad smooth bands on the water and a concentrated reflection of the sun. Both serial trials and the second wide trial had clear skies and ripples. The water-detail metric in the table is the mean absolute luminance difference between neighboring pixels divided by the region’s median luminance. Sky detail is the mean absolute residual from a five-pixel Gaussian blur in a fixed sky region, in 8-bit luma units at 640 × 352. Each reported value is the median over that trial’s stationary images. The clear-sky wide trial also had finer-scale differences from the serial trials. Weather and illumination remain potential confounders.
 
 By the end of each stationary window the renderer had bound the same 238 shader identities with labels related to water, waves, foam, clouds or sky. Only the cloudy trial had also bound one additional foam vertex/pixel pair. These are cumulative first-bind events. They do not establish that a particular dispatch ran or what values a draw sampled. The cause of the occasional smooth surface remains open.
+
+## Prison cell
+
+Two more launches used private copies of the original prison save and settings, the same 2,495-file warm cache and the same executable as the boat trials. The camera was behind Lucia looking through the barred window. Three consecutive image matches on the character and window preceded 24 seconds of settling and a 120-second idle sample. Serial ran first. Both modes decoded and bound the repaired water program. The protected saves and settings verified after each run.
+
+| Mode | Displayed frames | FPS | P50 / P95 / P99 (ms) | GPU hash + compare (ms) | Other GPU lists (ms) | Pieces compared / fetched | Draws / missing pipeline / dropped indirect |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Serial | 386 | 3.204 | 311.6 / 341.0 / 358.7 | 50.1 | 141.1 | 16,801 / 1,464 | 4,910 / 339 / 0 |
+| Wide | 445 | 3.696 | 270.5 / 299.9 / 323.4 | 8.6 | 142.8 | 16,795 / 1,483 | 4,915 / 345 / 0 |
+
+Ten stationary images per mode showed the same sunlit prison yard, barred window and pillar, nearby bunk, and Lucia’s uniform and hair. At a 320 × 176 comparison resolution, the per-pixel median images differed by 0.61/255 mean absolute RGB in the window and pillar, 0.18 on the right wall and bunk, and 0.20 on the left wall. The character region differed by 2.41/255. Splitting each mode’s own captures into even and odd groups gave 5.30/255 and 6.54/255 in that region as the character idled. These samples cover one camera and one pair. The close-up eyes, mouth timing, other rooms and normal simulation speed need their own checks. Each prison launch also had only the informational Display 4127 event in the NVIDIA and Display system logs.
+
+On another RTX 5080, wildheathen independently observed cheaper GPU hash and compare passes with driver 621.24 and a different streaming stack. They describe the smaller whole-frame difference in their prologue runs as within scene variation. Their result and the fixed-camera measurements here cover different workloads. [Independent A/B/A/B report](https://github.com/fxceless/victory-fork/pull/1014#issuecomment-7174823244)
 
 ## Changed-piece validation
 
