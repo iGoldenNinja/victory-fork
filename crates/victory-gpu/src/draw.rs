@@ -267,6 +267,8 @@ pub(crate) struct State {
     root_srv_slots: std::collections::HashMap<(usize, u64), RootSlot>,
     /// Root UAVs bound as one-view tables in this list, likewise.
     root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
+    #[cfg(feature = "diagnostics")]
+    light_bindings: Option<crate::light_inputs::Dispatch>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
 }
@@ -1185,11 +1187,66 @@ impl State {
                     return false;
                 }
             }
+            #[cfg(feature = "diagnostics")]
+            if compute {
+                self.light_bindings = crate::light_inputs::sampled_frame().and_then(|frame| {
+                    crate::light_inputs::bindings(frame, &stage.shader.hash, &t.used, |u| {
+                        let sent = stage.user_data.is_some() && t.host.user_data.iter()
+                            .any(|word| word.root == RootType::Table && word.slot == u.slot);
+                        if sent {
+                            self.light_table_texture(u, &made)
+                        } else {
+                            Err("host shader has no table offset for this root")
+                        }
+                    })
+                });
+            }
         }
         // Depth textures it writes through unordered access: their colour
         // twins hold what they lack from here on.
         list.twins_written();
         true
+    }
+
+    /// The sampled host texture must be the original title view's resource,
+    /// in a dynamic slot reserved for this list. A null, a colour twin or a
+    /// mutable mirror cannot establish that identity at execution.
+    #[cfg(feature = "diagnostics")]
+    fn light_table_texture(
+        &self,
+        u: &UsedResource,
+        made: &[(u8, u32)],
+    ) -> Result<std::sync::Arc<crate::resource::HostTexture>, &'static str> {
+        let Some(&Root::Table(table)) = self.roots_ref(true).get(usize::from(u.slot)) else {
+            return Err("root table absent");
+        };
+        let start = made.iter().find(|(slot, _)| *slot == u.slot)
+            .ok_or("table lacks a list-reserved host slot")?.1;
+        let heap = self.heap_of(table).ok_or("table outside the bound heaps")?;
+        let handle = table.checked_add(u64::from(u.table_offset_dwords) * 4)
+            .ok_or("table offset exceeds address range")?;
+        if u.table_offset_dwords % 8 != 0
+            || heap.index(handle).is_none()
+            || !crate::texture::committed(handle as *const u8, 12)
+        {
+            return Err("descriptor is outside readable table slots");
+        }
+        let view = crate::descriptor::view(handle).ok_or("title descriptor absent")?;
+        let resource = match (u.kind, view) {
+            (ResourceType::Srv, View::Shader(resource, _))
+            | (ResourceType::Uav, View::Unordered(resource, _, _)) => resource,
+            _ => return Err("descriptor has no matching resource object"),
+        };
+        let texture = crate::resource::probe_texture(resource as This)
+            .ok_or("buffer or texture without a host copy")?;
+        let index = (start / 32).checked_add(u.table_offset_dwords / 8)
+            .ok_or("host slot index exceeds range")?;
+        let host = heap.host().ok_or("host heap absent")?;
+        match host.shows(index, &texture.texture) {
+            Some(true) => Ok(texture),
+            Some(false) => Err("slot shows a different host resource"),
+            None => Err("slot lacks a retained host resource"),
+        }
     }
 
     /// Binds a root UAV: a raw unordered access view of the title buffer's
@@ -2123,6 +2180,12 @@ impl State {
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        if let Some(dispatch) = self.light_bindings.take()
+            && x != 0 && y != 0 && z != 0
+        {
+            list.defer_light_bindings(dispatch);
+        }
         #[cfg(feature = "diagnostics")]
         if let Some(stage) = p.stages.first()
             && let Some(sequence) = crate::light_probe::sample(&stage.shader.hash)

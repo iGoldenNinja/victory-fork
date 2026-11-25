@@ -1394,6 +1394,16 @@ fn hosted(this: This, make: bool) -> Option<Made> {
 /// The host copy of title texture `this` if it is made, without making it
 /// (for diagnostics, which must not count as a use).
 #[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn probe_texture(this: This) -> Option<std::sync::Arc<HostTexture>> {
+    if this.is_null() {
+        return None;
+    }
+    let made = resource(this).host.made.lock().unwrap_or_else(|e| e.into_inner());
+    made.as_ref().map(|(texture, _)| texture.clone())
+}
+
+/// The host copy of title texture `this` if it is made, without making it.
+#[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn host_made<'a>(
     this: This,
 ) -> Option<&'a windows::Win32::Graphics::Direct3D12::ID3D12Resource> {

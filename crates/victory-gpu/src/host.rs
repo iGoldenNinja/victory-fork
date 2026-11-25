@@ -1919,6 +1919,8 @@ struct Deferred {
     indirect_traces: Vec<crate::indirect::DispatchTrace>,
     #[cfg(feature = "diagnostics")]
     light_samples: Vec<crate::light_probe::Readback>,
+    #[cfg(feature = "diagnostics")]
+    light_bindings: Vec<crate::light_inputs::Dispatch>,
     /// Whether the indirect-work budget is zeroed for this recording (a
     /// step on the CPU, or in the list for the card's copy).
     budget_zeroed: bool,
@@ -3567,8 +3569,10 @@ pub(crate) fn walls_trace() -> bool {
 /// ([`late`]) did not, at any stage: the flights' lists were settled
 /// without it, so the title read a buffer nobody wrote, as before read-backs
 /// were made (the exposure metering's two small float targets, every frame).
-fn read_backs(list: &HostList) {
+fn read_backs(list: &HostList, _submission: u64, _ordinal: usize) {
     let deferred = list.deferred();
+    #[cfg(feature = "diagnostics")]
+    crate::light_inputs::completed((_submission, _ordinal), &deferred.light_bindings);
     #[cfg(feature = "diagnostics")]
     for trace in &deferred.indirect_traces {
         trace.report();
@@ -4847,8 +4851,8 @@ impl Host {
             match item {
                 Late::Run(flight) => {
                     last = flight.number;
-                    for &i in &flight.order {
-                        read_backs(flight.lists[i].host());
+                    for (ordinal, &i) in flight.order.iter().enumerate() {
+                        read_backs(flight.lists[i].host(), flight.number, ordinal);
                     }
                     if let Some(card) = flight.card {
                         self.card_done(card);
@@ -5273,8 +5277,8 @@ impl Host {
                 match item {
                     Late::Run(flight) => {
                         last = flight.number;
-                        for &i in &flight.order {
-                            read_backs(flight.lists[i].host());
+                        for (ordinal, &i) in flight.order.iter().enumerate() {
+                            read_backs(flight.lists[i].host(), flight.number, ordinal);
                         }
                         if let Some(card) = flight.card {
                             self.card_done(card);
@@ -5589,10 +5593,10 @@ impl Host {
             add(C::NothingBackUs, gpu.as_micros() as u64);
         }
         copy_back(0, copying.elapsed().as_micros() as u64);
-        for list in runs {
+        for (ordinal, list) in runs.iter().enumerate() {
             // Read backs first: a value written at the bottom of the pipe
             // may be what tells the title that they are there.
-            read_backs(list);
+            read_backs(list, this_submission, ordinal);
             for &(at, what, bytes) in &list.deferred().writes {
                 what.write(at as *mut u8, bytes);
             }
@@ -6476,6 +6480,11 @@ impl HostList {
     #[cfg(feature = "diagnostics")]
     pub(crate) fn defer_light_sample(&self, sample: crate::light_probe::Readback) {
         self.deferred().light_samples.push(sample);
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn defer_light_bindings(&self, dispatch: crate::light_inputs::Dispatch) {
+        self.deferred().light_bindings.push(dispatch);
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.

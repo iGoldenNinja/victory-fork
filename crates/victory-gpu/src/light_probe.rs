@@ -15,7 +15,7 @@ use crate::{
     object::This,
 };
 
-const SHADER: &str = "34fb51b8a0312e82";
+pub(crate) const SHADER: &str = "34fb51b8a0312e82";
 const ROWS: u32 = 8;
 
 fn enabled(value: Option<&std::ffi::OsStr>) -> bool {
