@@ -1215,65 +1215,100 @@ void main() {
     #[test]
     #[ignore = "requires a physical D3D12 adapter"]
     fn hardware_card_hashes_match_bytewise_piece_decisions() {
-        const PIECE: usize = 65536;
-        const SKEW: usize = 0x3450;
+        const PIECE: usize = 64 << 10;
         const COUNT: usize = 67;
         const PREFIX: usize = 3;
         const SENTINEL: u32 = 0x6973_beef;
+        let ranges: [(usize, usize, usize); 2] = [(1, 0x3450, 70 * PIECE), (0, 0x3457, 66 * PIECE)];
         let mut gpu = WarpHarness::for_adapter(false).expect("physical D3D12 adapter");
-        let initial: Vec<u8> = (0..(COUNT+3)*PIECE).map(|i| (i*131 + i/11) as u8).collect();
-        for (name, source, groups) in [("serial",crate::host::CARD_COMPARE,COUNT.div_ceil(64)),
-                                       ("wide",crate::host::CARD_COMPARE_WIDE,COUNT)] {
+        for (name, source, groups) in [
+            ("serial", crate::host::CARD_COMPARE, COUNT.div_ceil(64)),
+            ("wide", crate::host::CARD_COMPARE_WIDE, COUNT),
+        ] {
             let program = compile_cs(&gpu.device, source).expect("compile the actual GPU comparison");
-            let (_data, data_ptr, data_addr) = gpu.shared_buffer(initial.len() as u64);
-            let (_hashes, _, hash_addr) = gpu.shared_buffer(((COUNT+3)*16) as u64);
-            let (_flags, flags_ptr, flags_addr) = gpu.shared_buffer(((PREFIX+COUNT+2)*4) as u64);
-            let flags_ptr = flags_ptr.cast::<u32>();
-            let mut current = initial.clone();
-            let mut saved = initial.clone();
-            let mut changed = 0usize;
-            for round in 0..19usize {
-                let mode = if round == 0 { 0 } else if round % 3 == 0 { 2 } else { 1 };
-                if round > 0 && round % 3 != 1 {
-                    for piece in 0..COUNT {
-                        if (piece + 11*round) % 7 >= round % 8 { continue; }
-                        let start = (piece+1)*PIECE-SKEW;
-                        for off in [0, 15, 16, 1023, 1024, PIECE-16, PIECE-1, (piece*397+round*257)%PIECE] {
-                            let pos = start+off;
-                            current[pos] = if round % 4 == 0 { initial[pos] } else { current[pos] ^ (round as u8 | 1) };
+            // An interior subrange with full pieces, then a whole buffer with both end
+            // pieces clipped and their internal boundaries between 16-byte load steps.
+            for (first, skew, size) in ranges {
+                let bounds = |piece: usize| {
+                    let start = ((first + piece) * PIECE).saturating_sub(skew).min(size);
+                    let end = ((first + piece + 1) * PIECE).saturating_sub(skew).min(size);
+                    start..end
+                };
+                let initial: Vec<u8> = (0..size).map(|i| (i * 131 + i / 11) as u8).collect();
+                let (_data, data_ptr, data_addr) = gpu.shared_buffer(size as u64);
+                let (_hashes, _, hash_addr) = gpu.shared_buffer(((first + COUNT) * 16) as u64);
+                let flag_count = PREFIX + COUNT + 2;
+                let (_flags, flags_ptr, flags_addr) = gpu.shared_buffer((flag_count * 4) as u64);
+                let flags_ptr = flags_ptr.cast::<u32>();
+                let mut current = initial.clone();
+                let mut saved = initial.clone();
+                let mut changed = 0;
+                for round in 0..=18 {
+                    let mode = match round {
+                        0 => 0,                   // establish the baseline
+                        n if n % 3 == 0 => 2,     // compare and update the baseline
+                        _ => 1,                   // compare against the most recent store
+                    };
+                    if round > 0 && round % 3 != 1 {
+                        for piece in 0..COUNT {
+                            if (piece + 11 * round) % 7 >= round % 8 {
+                                continue;
+                            }
+                            let span = bounds(piece);
+                            let len = span.len();
+                            let sample = (piece * 397 + round * 257) % len;
+                            for offset in [0, 15, 16, 1023, 1024, len - 16, len - 1, sample] {
+                                let pos = span.start + offset;
+                                current[pos] = if round % 4 == 0 {
+                                    initial[pos]
+                                } else {
+                                    current[pos] ^ (round as u8 | 1)
+                                };
+                            }
                         }
                     }
-                }
-                let mut expected = vec![SENTINEL; PREFIX+COUNT+2];
-                if mode != 0 {
-                    for piece in 0..COUNT {
-                        let start = (piece+1)*PIECE-SKEW;
-                        let span = start..start+PIECE;
-                        expected[PREFIX+piece] = u32::from(current[span.clone()] != saved[span]);
-                        changed += expected[PREFIX+piece] as usize;
+                    let mut expected = vec![SENTINEL; flag_count];
+                    if mode != 0 {
+                        for piece in 0..COUNT {
+                            let raw = bounds(piece);
+                            // The renderer includes whole 16-byte loads at both ends.
+                            let span = (raw.start & !15)..raw.end.next_multiple_of(16);
+                            let flag = u32::from(current[span.clone()] != saved[span]);
+                            expected[PREFIX + piece] = flag;
+                            changed += flag as usize;
+                        }
+                    }
+                    let args = [
+                        first as u32, skew as u32, size as u32, COUNT as u32, (PREFIX * 4) as u32, mode,
+                    ];
+                    // SAFETY: the CPU owns the mappings after the preceding round's fence.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(current.as_ptr(), data_ptr, size);
+                        for i in 0..flag_count {
+                            flags_ptr.add(i).write_volatile(SENTINEL);
+                        }
+                        gpu.list.SetComputeRootSignature(&program.root);
+                        gpu.list.SetPipelineState(&program.pso);
+                        gpu.list.SetComputeRoot32BitConstants(0, 6, args.as_ptr().cast(), 0);
+                        gpu.list.SetComputeRootShaderResourceView(1, data_addr);
+                        gpu.list.SetComputeRootUnorderedAccessView(2, hash_addr);
+                        gpu.list.SetComputeRootUnorderedAccessView(3, flags_addr);
+                        gpu.list.Dispatch(groups as u32, 1, 1);
+                    }
+                    gpu.submit_and_wait();
+                    // SAFETY: all flags are in the mapped range and the dispatch has completed.
+                    let actual: Vec<u32> = (0..flag_count)
+                        .map(|i| unsafe { flags_ptr.add(i).read_volatile() })
+                        .collect();
+                    assert_eq!(actual, expected, "{name}, skew {skew:#x}, round {round}");
+                    if mode != 1 {
+                        saved.copy_from_slice(&current);
                     }
                 }
-                // SAFETY: the CPU owns the full mappings after the previous round's fence.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(current.as_ptr(), data_ptr, current.len());
-                    for i in 0..expected.len() { flags_ptr.add(i).write_volatile(SENTINEL); }
-                    gpu.list.SetComputeRootSignature(&program.root);
-                    gpu.list.SetPipelineState(&program.pso);
-                    let args = [1u32, SKEW as u32, current.len() as u32, COUNT as u32, (PREFIX*4) as u32, mode];
-                    gpu.list.SetComputeRoot32BitConstants(0, 6, args.as_ptr().cast(), 0);
-                    gpu.list.SetComputeRootShaderResourceView(1, data_addr);
-                    gpu.list.SetComputeRootUnorderedAccessView(2, hash_addr);
-                    gpu.list.SetComputeRootUnorderedAccessView(3, flags_addr);
-                    gpu.list.Dispatch(groups as u32, 1, 1);
-                }
-                gpu.submit_and_wait();
-                // SAFETY: the dispatch has completed and the mapping holds every flag.
-                let actual: Vec<u32> = (0..expected.len()).map(|i| unsafe { flags_ptr.add(i).read_volatile() }).collect();
-                assert_eq!(actual, expected, "{name}, round {round}");
-                if mode != 1 { saved.copy_from_slice(&current); }
+                let decisions = 18 * COUNT;
+                assert!(changed > 0 && changed < decisions);
+                eprintln!("{name}, skew {skew:#x}: {changed} changed of {decisions} bytewise piece decisions");
             }
-            assert!(changed > 0 && changed < 18*COUNT);
-            eprintln!("{name}: {changed} changed of {} bytewise piece decisions", 18*COUNT);
         }
     }
 
