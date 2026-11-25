@@ -254,6 +254,8 @@ pub(crate) struct State {
     /// Graphics, compute.
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
+    #[cfg(feature = "diagnostics")]
+    traced_binding: Option<crate::capture::lineage::Binding>,
     /// Tables made afresh in this list: (table, slot count, contents) â†’ first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u32, u64), u32>,
@@ -979,6 +981,12 @@ impl State {
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
+        #[cfg(feature = "diagnostics")]
+        let trace_frame = {
+            self.traced_binding = None;
+            let frame = crate::queue::presented() + 1;
+            crate::capture::lineage::active(frame).then_some(frame)
+        };
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
         if crate::host::walls_trace() {
@@ -1069,6 +1077,22 @@ impl State {
                         Some(&(_, offset)) => offset,
                         None => self.user_value(compute, u.slot, u.root, u.dword),
                     };
+                }
+                #[cfg(feature = "diagnostics")]
+                if let Some(frame) = trace_frame
+                    && let Some(target) = crate::capture::lineage::target(&stage.shader.hash, compute)
+                    && t.used.iter().any(|u| u.root == RootType::Table && u.slot == target.table
+                        && u.table_offset_dwords == target.dword && u.kind == if compute { ResourceType::Uav } else { ResourceType::Srv })
+                    && let Some(u) = t.host.user_data.iter().find(|u| u.root == RootType::Table && u.slot == target.table)
+                    && let Some(index) = crate::capture::lineage::host_index(values[u.index as usize], target.dword)
+                    && let Some(&Root::Table(base)) = self.roots_ref(compute).get(usize::from(target.table))
+                    && let Some(heap) = self.heap_of(base).and_then(|h| h.host())
+                {
+                    let guest = base.checked_add(u64::from(target.dword) * 4)
+                        .filter(|&at| self.heap_of(at).is_some() && crate::texture::committed(at as *const u8, 12))
+                        .and_then(crate::descriptor::view)
+                        .as_ref().map_or(0, crate::capture::lineage::guest_resource);
+                    self.traced_binding = Some(crate::capture::lineage::Binding { frame, target, slot: heap.watch_slot(index), guest });
                 }
                 // SAFETY: an open list; `values` covers the parameter.
                 unsafe {
@@ -2066,6 +2090,12 @@ impl State {
         });
     }
 
+    #[cfg(feature = "diagnostics")]
+    fn trace_draw(&mut self, list: &HostList, compute: bool) -> Option<crate::capture::lineage::Pending> {
+        let target = if compute { None } else { self.targets.first().copied().filter(|r| *r != 0) };
+        self.traced_binding.take()?.begin(list, target)
+    }
+
     /// Runs a dispatch on the host.
     #[cfg(feature = "diagnostics")]
     fn begin_pass_region(&self, list: &HostList, p: &crate::pipeline::host::HostPipeline) -> Option<crate::capture::pass::Pending> {
@@ -2134,8 +2164,12 @@ impl State {
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         #[cfg(feature = "diagnostics")]
         let pass = self.begin_pass_region(list, p);
+        #[cfg(feature = "diagnostics")]
+        let observed = self.trace_draw(list, true);
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        #[cfg(feature = "diagnostics")]
+        if let Some(observed) = observed { observed.end(list); }
         #[cfg(feature = "diagnostics")]
         if let Some(pass) = pass { pass.end(list); }
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -2824,11 +2858,15 @@ impl State {
             };
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
+            #[cfg(feature = "diagnostics")]
+            let observed = self.trace_draw(list, false);
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
+            #[cfg(feature = "diagnostics")]
+            if let Some(observed) = observed { observed.end(list); }
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -2925,11 +2963,15 @@ impl State {
         if ran {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
+            #[cfg(feature = "diagnostics")]
+            let observed = self.trace_draw(list, false);
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
+            #[cfg(feature = "diagnostics")]
+            if let Some(observed) = observed { observed.end(list); }
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -3180,6 +3222,8 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         let pass = (kind == DISPATCH).then(|| self.begin_pass_region(list, p)).flatten();
+        #[cfg(feature = "diagnostics")]
+        let observed = self.trace_draw(list, kind == DISPATCH);
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
         unsafe {
@@ -3214,6 +3258,8 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
+        #[cfg(feature = "diagnostics")]
+        if let Some(observed) = observed { observed.end(list); }
         #[cfg(feature = "diagnostics")]
         if let Some(pass) = pass { pass.end(list); }
         // The scratch buffer stays readable as arguments: the next draw of

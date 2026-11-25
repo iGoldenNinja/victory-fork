@@ -1926,6 +1926,8 @@ struct Deferred {
     light_samples: Vec<crate::light_probe::Readback>,
     #[cfg(feature = "diagnostics")]
     pass_regions: Vec<crate::capture::pass::Region>,
+    #[cfg(feature = "diagnostics")]
+    descriptor_events: Vec<crate::capture::lineage::Event>,
     /// Whether the indirect-work budget is zeroed for this recording (a
     /// step on the CPU, or in the list for the card's copy).
     budget_zeroed: bool,
@@ -3588,6 +3590,8 @@ fn read_backs(list: &HostList) {
     for region in &deferred.pass_regions {
         region.report();
     }
+    #[cfg(feature = "diagnostics")]
+    for event in &deferred.descriptor_events { event.completed(); }
     for back in &deferred.texture_backs {
         crate::texback::land(back);
     }
@@ -5456,6 +5460,8 @@ impl Host {
         let prepared = std::time::Instant::now();
         if late {
             *submitted += 1;
+            #[cfg(feature = "diagnostics")]
+            Self::trace_descriptor_submission(runs, this_submission, *submitted);
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
                 self.queue.ExecuteCommandLists(&lists);
@@ -5496,6 +5502,8 @@ impl Host {
         submitting(2, runs.len());
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
+            #[cfg(feature = "diagnostics")]
+            Self::trace_descriptor_submission(if timing() { &runs[i..=i] } else { runs }, this_submission, *submitted);
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
@@ -5623,6 +5631,14 @@ impl Host {
         }
         working(was_working);
         None
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn trace_descriptor_submission(runs: &[&HostList], submission: u64, fence: u64) {
+        if !crate::capture::lineage::enabled() { return; }
+        for (position, list) in runs.iter().enumerate() {
+            for event in &list.deferred().descriptor_events { event.submit(submission, fence, position); }
+        }
     }
 
     /// With `VICTORY_D3D12_DRED`: the faulting address and the allocations
@@ -6525,6 +6541,11 @@ impl HostList {
     #[cfg(feature = "diagnostics")]
     pub(crate) fn pass_texture_state(&self, resource: crate::object::This) -> Option<(std::sync::Arc<crate::resource::HostTexture>, D3D12_RESOURCE_STATES)> {
         let texture = crate::resource::host_made(resource)?;
+        self.tracked_texture_state(texture)
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn tracked_texture_state(&self, texture: &ID3D12Resource) -> Option<(std::sync::Arc<crate::resource::HostTexture>, D3D12_RESOURCE_STATES)> {
         self.states.lock().unwrap_or_else(|e| e.into_inner()).values()
             .find(|(_, _, copy)| &copy.texture == texture)
             .map(|(_, state, copy)| (copy.clone(), D3D12_RESOURCE_STATES(*state as i32)))
@@ -6533,6 +6554,11 @@ impl HostList {
     #[cfg(feature = "diagnostics")]
     pub(crate) fn defer_pass_region(&self, region: crate::capture::pass::Region) {
         self.deferred().pass_regions.push(region);
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn defer_descriptor_event(&self, event: crate::capture::lineage::Event) {
+        self.deferred().descriptor_events.push(event);
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
@@ -7857,6 +7883,8 @@ impl Host {
             };
             copy.reset();
             let list = &copy.list;
+            #[cfg(feature = "diagnostics")]
+            crate::capture::lineage::marker(copy, frame, "present-source", 0, texture);
             list.ResourceBarrier(&[
                 transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
                 transition(

@@ -13,6 +13,26 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
+type SlotResources = Mutex<Vec<Option<ID3D12Resource>>>;
+#[cfg(feature = "diagnostics")]
+type KeptSlots = std::sync::Arc<SlotResources>;
+#[cfg(not(feature = "diagnostics"))]
+type KeptSlots = SlotResources;
+
+#[cfg(feature = "diagnostics")]
+pub(crate) struct WatchedSlot {
+    pub heap: usize,
+    pub index: u32,
+    slots: KeptSlots,
+}
+
+#[cfg(feature = "diagnostics")]
+impl WatchedSlot {
+    pub fn resource(&self) -> Option<ID3D12Resource> {
+        self.slots.lock().unwrap_or_else(|e| e.into_inner()).get(self.index as usize)?.clone()
+    }
+}
+
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
@@ -34,7 +54,7 @@ pub(crate) struct HostHeap {
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
     /// read there is a GPU page fault (the console reads stale memory).
-    kept: Mutex<Vec<Option<ID3D12Resource>>>,
+    kept: KeptSlots,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
@@ -952,7 +972,7 @@ impl HostHeap {
             sampler,
             made: Mutex::new(vec![0; count as usize]),
             copied: Mutex::new(Vec::new()),
-            kept: Mutex::new(vec![None; (count + extra) as usize]),
+            kept: Mutex::new(vec![None; (count + extra) as usize]).into(),
             next: Mutex::new((0, vec![false; DYNAMIC as usize])),
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
@@ -2021,6 +2041,12 @@ impl HostHeap {
         let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         let shown = kept.get(index as usize)?.as_ref()?;
         Some(windows::core::Interface::as_raw(shown) == windows::core::Interface::as_raw(buffer))
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn watch_slot(&self, index: u32) -> WatchedSlot {
+        use windows::core::Interface;
+        WatchedSlot { heap: self.heap.as_raw() as usize, index, slots: self.kept.clone() }
     }
 
     /// What the queue of textures picked by index knows of title slot

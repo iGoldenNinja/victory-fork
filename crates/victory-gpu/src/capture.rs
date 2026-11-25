@@ -23,6 +23,7 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 
 mod trigger;
 pub(crate) mod pass;
+pub(crate) mod lineage;
 
 pub(crate) fn poll_trigger(presenting: u64) {
     trigger::poll(presenting);
@@ -433,6 +434,7 @@ fn dump_one(
     d: &D3D12_RESOURCE_DESC,
 ) {
     let Ok(list) = host.new_list() else { return };
+    lineage::marker(&list, frame, "target-preview", resource as usize, texture);
     let state = D3D12_RESOURCE_STATES(crate::host::legal_state(texture, state) as i32);
     let copy = D3D12_RESOURCE_STATE_COPY_SOURCE;
     // SAFETY: an open list of ours and a live texture.

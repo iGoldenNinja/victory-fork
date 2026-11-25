@@ -9,11 +9,11 @@ use windows::Win32::Graphics::{Direct3D12::*, Dxgi::Common::*};
 use crate::{descriptor::View, host::{HostList, host, transition}, object::This, resource::HostTexture};
 
 pub(crate) struct Config {
-    hash: String,
+    pub(super) hash: String,
     pub table: u8,
     pub srv: u32,
     pub uav: u32,
-    rect: [u32; 4],
+    pub(super) rect: [u32; 4],
 }
 
 fn parse(text: &str) -> Option<Config> {
@@ -36,14 +36,18 @@ fn parse(text: &str) -> Option<Config> {
 pub(crate) fn selected(hash: &str) -> Option<(u64, &'static Config)> {
     let frame = crate::queue::presented() + 1;
     if !super::trigger::listed(frame) { return None; }
+    let cfg = config()?;
+    (cfg.hash == hash).then_some((frame, cfg))
+}
+
+pub(super) fn config() -> Option<&'static Config> {
     static CONFIG: OnceLock<Option<Config>> = OnceLock::new();
-    let cfg = CONFIG.get_or_init(|| {
+    CONFIG.get_or_init(|| {
         let text = std::env::var("VICTORY_CAPTURE_PASS").ok()?;
         let parsed = parse(&text);
         if parsed.is_none() { tracing::warn!("invalid compute pass capture selection"); }
         parsed
-    }).as_ref()?;
-    (cfg.hash == hash).then_some((frame, cfg))
+    }).as_ref()
 }
 
 struct Texture {
@@ -62,28 +66,35 @@ fn binding(list: &HostList, view: View, output: bool, rect: [u32; 4]) -> Option<
     let (copy, state) = list.pass_texture_state(id as This)?;
     if (output && state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
         || (!output && !state.contains(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)) { return None; }
-    // SAFETY: this list holds the tracked resource.
-    let d = unsafe { copy.texture.GetDesc() };
-    let [x, y, w, h] = rect;
-    if d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.MipLevels != 1
-        || d.DepthOrArraySize != 1 || d.SampleDesc.Count != 1
-        || u64::from(x + w) > d.Width || y + h > d.Height { return None; }
+    let texture = Texture::checked(copy, state, rect)?;
     if let Some(words) = desc {
         let dim = if output { D3D12_UAV_DIMENSION_TEXTURE2D.0 } else { D3D12_SRV_DIMENSION_TEXTURE2D.0 };
-        if words[1] != dim as u32 || crate::resource::pc_format(words[0]) != d.Format.0 as u32 { return None; }
+        if words[1] != dim as u32 || crate::resource::pc_format(words[0]) != texture.format.0 as u32 { return None; }
     }
-    let bpp = match d.Format {
-        DXGI_FORMAT_R11G11B10_FLOAT | DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R32_FLOAT => 4,
-        DXGI_FORMAT_R16G16B16A16_FLOAT => 8,
-        _ => return None,
-    };
-    Some(Texture { copy, state, format: d.Format, bpp })
+    Some(texture)
+}
+
+impl Texture {
+    fn checked(copy: Arc<HostTexture>, state: D3D12_RESOURCE_STATES, rect: [u32; 4]) -> Option<Self> {
+        // SAFETY: the host copy owns the live resource.
+        let d = unsafe { copy.texture.GetDesc() };
+        let [x, y, w, h] = rect;
+        if d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.MipLevels != 1
+            || d.DepthOrArraySize != 1 || d.SampleDesc.Count != 1
+            || u64::from(x + w) > d.Width || y + h > d.Height { return None; }
+        let bpp = match d.Format {
+            DXGI_FORMAT_R11G11B10_FLOAT | DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R32_FLOAT => 4,
+            DXGI_FORMAT_R16G16B16A16_FLOAT => 8,
+            _ => return None,
+        };
+        Some(Texture { copy, state, format: d.Format, bpp })
+    }
 }
 
 pub(crate) struct Region {
     back: ID3D12Resource,
     frame: u64,
-    name: &'static str,
+    name: String,
     format: DXGI_FORMAT,
     rect: [u32; 4],
     row: u32,
@@ -91,11 +102,11 @@ pub(crate) struct Region {
 }
 
 impl Region {
-    fn new(t: &Texture, frame: u64, name: &'static str, rect: [u32; 4]) -> Option<Self> {
+    fn new(t: &Texture, frame: u64, name: impl Into<String>, rect: [u32; 4]) -> Option<Self> {
         let row = rect[2] * t.bpp;
         let pitch = row.next_multiple_of(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
         let back = host()?.read_back_buffer(u64::from(pitch) * u64::from(rect[3]))?;
-        Some(Self { back, frame, name, format: t.format, rect, row, pitch })
+        Some(Self { back, frame, name: name.into(), format: t.format, rect, row, pitch })
     }
 
     fn record(&self, list: &HostList, t: &Texture) {
@@ -144,6 +155,19 @@ impl Region {
         })();
         if let Err(error) = write { tracing::warn!(%error, frame = self.frame, "compute pass region was not saved"); }
     }
+}
+
+/// Sample the resource the actual host slot holds only when this list owns
+/// its state and the selected rectangle is valid for its subresource.
+pub(super) fn sample_native(list: &HostList, native: &ID3D12Resource, required: D3D12_RESOURCE_STATES,
+                            frame: u64, name: String, rect: [u32; 4]) -> bool {
+    let Some((copy, state)) = list.tracked_texture_state(native) else { return false };
+    if !state.contains(required) { return false; }
+    let Some(texture) = Texture::checked(copy, state, rect) else { return false };
+    let Some(region) = Region::new(&texture, frame, name, rect) else { return false };
+    region.record(list, &texture);
+    list.defer_pass_region(region);
+    true
 }
 
 pub(crate) struct Pending(Texture, Region);
