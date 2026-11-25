@@ -17,3 +17,11 @@ AI-assisted testing and analysis with OpenAI Codex.
 In the prison room, recorded controller input turned the camera both ways and changed the distance to the desk and lamp during forward and backward movement. Substantial character, room and lighting defects were visible. The five-minute run, with four separate marked movement inputs, recorded 737 displayed application frames over 300.016 s. It averaged 2.453 FPS, with 740.854 ms P99 frame time and a worst interval of 981.953 ms. The mean measured GPU busy time was 147.23 ms per displayed interval. The exact-PID trace showed no generated frames. Title-process loopback contained real audio during gameplay. A passing real-time animation and audio-sync test is still pending.
 
 The frame-time result covers the pinned SSD build. Separately, the earlier wave64 evidence covers four opening-sequence pipeline rejections.
+
+## Five-minute comparison on NVIDIA fork c96b4f2
+
+Same computer, SATA SSD, Series X, and DRED. This second run reused the cache warmed by the first run and followed a similar movement path in the same prison room. The character was more complete, more of the room rendered, and the interaction tutorial was visible. Lighting and geometry defects remained.
+
+PresentMon captured 1,085 displayed application frames over 300.069 s. Average 3.612 FPS, P99 664.398 ms, worst interval 1,017.174 ms, and mean GPU busy time 195.05 ms per displayed interval. During several room samples the parallel copy-back thread reported approximately 180–215 ms per frame. These timing fields overlap. Both five-minute captures missed the 30 FPS gameplay target.
+
+The four earlier wave64 cases also reproduced rejection in an offline host compute PSO creation check on this revision. All four compiled and passed DXIL validation. None created a PSO. Both title runs reached player control with no D3D12 device-removal message in the logs.
