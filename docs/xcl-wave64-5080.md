@@ -25,6 +25,12 @@ xcl shaders $inputs --precompile --only cs --pipelines --split 1
 xcl shaders $inputs --direct --sample 0 --validate --threads 1 --json
 ```
 
+## Retail graphics and title startup
+
+The retail GPU suite executed all seven tests with the same input archive. Six passed. `retail_es_gs_voxelize_geometry_mode` failed the dominant-axis geometry projection check with the same values reported on driver 617.42 in the XCL GPU thread. The other tester reported a pass with driver 621.24. This system ran 617.14. [Local GPU results in the XCL thread](https://github.com/xcl-dev/xcl/issues/42#issuecomment-7152366749)
+
+On a clean profile with the stock HLSL runtime, a 300-second title run through a local read-through package view produced black pixels in all 11 internal back-buffer snapshots. A launcher-only variant that pointed to the ordinary SATA SSD package directory reached the visible Player 1 screen in two runs. It booted a verified copy of the executable inside a private title data directory. With the existing XCL `XCL_PRESS_A_AT=72` controller test, the title registered A, rendered the animated intro, and reached the first Navigation Experience setup screen. The runs shared the XCL shader cache. The result establishes a startup path through the first setup screen. Gameplay, keyboard control, and performance in a playable scene remain unverified in XCL.
+
 [Source revision](https://github.com/xcl-dev/xcl/commit/cbc296ab65a2661a61e3e2da109134bcd5319f60) · [XCL wave64 design](https://github.com/xcl-dev/xcl/blob/cbc296ab65a2661a61e3e2da109134bcd5319f60/docs/wave64-on-wave32.md) · [Related VIctory report](https://github.com/Marvisak/VIctory/issues/71#issuecomment-7151627014)
 
 AI-assisted testing and reporting with OpenAI Codex.
