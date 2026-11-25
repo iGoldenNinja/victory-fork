@@ -86,7 +86,7 @@ impl Texture {
             || d.DepthOrArraySize != 1 || d.SampleDesc.Count != 1
             || u64::from(x + w) > d.Width || y + h > d.Height { return None; }
         let bpp = match d.Format {
-            DXGI_FORMAT_R11G11B10_FLOAT | DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R32_FLOAT
+            DXGI_FORMAT_R11G11B10_FLOAT | DXGI_FORMAT_R10G10B10A2_UNORM | DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R32_FLOAT
             | DXGI_FORMAT_R32_TYPELESS | DXGI_FORMAT_D32_FLOAT => 4,
             DXGI_FORMAT_R16G16B16A16_FLOAT => 8,
             _ => return None,
@@ -206,6 +206,30 @@ pub(super) fn sample_native(list: &HostList, native: &ID3D12Resource, required: 
     let Some(region) = Region::new(&texture, frame, name, rect) else { return false };
     region.record(list, &texture);
     list.defer_pass_region(region);
+    true
+}
+
+/// Shadow CBVs and SRVs use implicitly promoted read states like the ordinary
+/// shadow readbacks. An explicitly transitioned indirect buffer is restored.
+pub(super) fn sample_buffer(list: &HostList, source: &ID3D12Resource, offset: u64, bytes: u64,
+                            state: Option<D3D12_RESOURCE_STATES>, frame: u64, name: String) -> bool {
+    if bytes == 0 || bytes > 1_048_576 || !bytes.is_multiple_of(4) { return false; }
+    // SAFETY: the caller retains the source across recording and submission.
+    let desc = unsafe { source.GetDesc() };
+    if desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER
+        || offset.checked_add(bytes).is_none_or(|end| end > desc.Width) { return false; }
+    let Some(back) = host().and_then(|h| h.read_back_buffer(bytes)) else { return false };
+    let copy = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    unsafe {
+        if let Some(before) = state { list.list.ResourceBarrier(&[transition(source, before, copy)]); }
+        list.list.CopyBufferRegion(&back, 0, source, offset, bytes);
+        if let Some(before) = state { list.list.ResourceBarrier(&[transition(source, copy, before)]); }
+    }
+    list.keep(source);
+    let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+    footprint.Footprint.RowPitch = bytes as u32;
+    list.defer_pass_region(Region { back, frame, name, format: DXGI_FORMAT_R32_UINT,
+        rect: [0, 0, bytes as u32 / 4, 1], row: bytes as u32, footprint, area: None, start: 0 });
     true
 }
 

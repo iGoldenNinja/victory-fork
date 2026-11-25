@@ -37,10 +37,10 @@ fn readers() -> Option<&'static Readers> {
 
 pub(crate) fn active(frame: u64) -> bool {
     (super::trigger::listed(frame) || (frame > 1 && super::trigger::listed(frame - 1)))
-        && readers().is_some() && super::pass::config().is_some()
+        && enabled() && super::pass::config().is_some()
 }
 
-pub(crate) fn enabled() -> bool { readers().is_some() }
+pub(crate) fn enabled() -> bool { readers().is_some() || super::producer::config().is_some() }
 
 pub(crate) struct Target {
     pub table: u8,
@@ -48,11 +48,19 @@ pub(crate) struct Target {
     shader: &'static str,
     writer: bool,
     pub input_dword: Option<u32>,
+    pub extra_dword: Option<u32>,
+    producer: bool,
     rect: [u32; 4],
 }
 
 pub(crate) fn target(hash: &str, compute: bool) -> Option<Target> {
     let pass = super::pass::config()?;
+    let upstream = super::producer::config();
+    if compute && let Some(cfg) = upstream
+        && let Some(shader) = cfg.shaders.iter().find(|h| h.as_str() == hash) {
+        return Some(Target { table: cfg.table, dword: cfg.output, shader, writer: true,
+            input_dword: Some(cfg.list), extra_dword: Some(cfg.constant), producer: true, rect: cfg.rect });
+    }
     let (table, dword, shader) = if compute {
         if pass.hash != hash { return None; }
         (pass.table, pass.uav, pass.hash.as_str())
@@ -61,7 +69,9 @@ pub(crate) fn target(hash: &str, compute: bool) -> Option<Target> {
         let name = config.hashes.iter().find(|h| h.as_str() == hash)?;
         (config.table, config.dword, name.as_str())
     };
-    Some(Target { table, dword, shader, writer: compute, input_dword: compute.then_some(pass.srv), rect: pass.rect })
+    let extra_dword = upstream.filter(|cfg| compute && cfg.table == table).map(|cfg| cfg.downstream);
+    Some(Target { table, dword, shader, writer: compute, input_dword: compute.then_some(pass.srv),
+        extra_dword, producer: false, rect: pass.rect })
 }
 
 pub(crate) fn host_index(root_bytes: u32, dword: u32) -> Option<u32> {
@@ -74,6 +84,7 @@ pub(crate) struct Binding {
     pub slot: WatchedSlot,
     pub guest: usize,
     pub input: Option<(WatchedSlot, Option<View>)>,
+    pub extra: Option<(WatchedSlot, Option<View>)>,
 }
 
 pub(crate) fn guest_resource(view: &View) -> usize {
@@ -158,13 +169,29 @@ impl Binding {
             let guest = view.as_ref().map_or(0, guest_resource);
             let expected = (guest != 0).then(|| crate::resource::host_made(guest as This)).flatten();
             let tracked = input.as_ref().and_then(|r| list.tracked_texture_state(r));
-            let sampled = input.as_ref().is_some_and(|r| super::pass::sample_native(list, r,
-                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, frame, format!("slot-{id}-input-before"), t.rect));
+            let sampled = if t.producer {
+                super::producer::sample_slot(list, &slot, view.as_ref(), frame, format!("slot-{id}-list-before"))
+            } else { input.as_ref().is_some_and(|r| super::pass::sample_native(list, r,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, frame, format!("slot-{id}-input-before"), t.rect)) };
             let view_words = view.as_ref().and_then(|v| match v { View::Shader(_, words) => *words, _ => None });
             tracing::info!(id=input_id, frame, role="compute-input", writer=id, shader=t.shader, dword=t.input_dword,
                 heap=slot.heap, index=slot.index, guest, expected=native(expected), native=native(input.as_ref()),
                 state=tracked.as_ref().map(|(_, s)| s.0), ?view_words, sampled, "descriptor trace binding");
             list.defer_descriptor_event(Event { id: input_id, frame, slot: Some(slot) });
+        }
+        if let Some((slot, view)) = self.extra {
+            let resource = slot.resource();
+            let extra_id = next_id();
+            let sampled = if t.producer {
+                super::producer::sample_slot(list, &slot, view.as_ref(), frame, format!("slot-{id}-constants-before"))
+            } else {
+                resource.as_ref().zip(super::producer::config()).is_some_and(|(r,cfg)|
+                    super::pass::sample_native(list, r, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, frame,
+                        format!("slot-{id}-feed-before"), cfg.rect))
+            };
+            tracing::info!(id=extra_id, frame, role="extra-input", writer=id, shader=t.shader, dword=t.extra_dword,
+                heap=slot.heap, index=slot.index, native=native(resource.as_ref()), sampled, "descriptor trace binding");
+            list.defer_descriptor_event(Event { id: extra_id, frame, slot: Some(slot) });
         }
         let sampled = actual.as_ref().is_some_and(|r| sample(r, source_state, "bound-before"));
         let rt_before = target.as_ref().is_some_and(|r| sample(r, D3D12_RESOURCE_STATE_RENDER_TARGET, "rt-before"));
@@ -178,6 +205,18 @@ impl Binding {
 }
 
 impl Pending {
+    pub(crate) fn indirect(&self, list: &HostList, source: &ID3D12Resource, at: u64,
+                           second: Option<u64>, maximum: u32, uses_counter: bool) {
+        if !self.target.producer { return; }
+        let state = list.indirect_state(source);
+        if state != D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT { return; }
+        let capture = |offset: u64, tag: &str| super::pass::sample_buffer(list, source, offset, 12, Some(state),
+            self.frame, format!("slot-{}-args-{tag}", self.id));
+        let first = capture(at, "first");
+        let overflow = second.and_then(|extra| at.checked_add(extra)).map(|offset| capture(offset, "second"));
+        tracing::info!(id=self.id, frame=self.frame, maximum, uses_counter, first, ?overflow, "producer indirect arguments");
+    }
+
     pub(crate) fn end(self, list: &HostList) {
         let (state, tag) = if self.target.writer { (D3D12_RESOURCE_STATE_UNORDERED_ACCESS, "bound-after") }
             else { (D3D12_RESOURCE_STATE_RENDER_TARGET, "rt-after") };

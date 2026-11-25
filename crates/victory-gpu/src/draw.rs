@@ -1092,12 +1092,14 @@ impl State {
                         .filter(|&at| self.heap_of(at).is_some() && crate::texture::committed(at as *const u8, 12))
                         .and_then(crate::descriptor::view);
                     let guest = view_at(target.dword).as_ref().map_or(0, crate::capture::lineage::guest_resource);
-                    let input = target.input_dword.and_then(|dword| {
+                    let watched = |dword| {
                         let index = crate::capture::lineage::host_index(values[u.index as usize], dword)?;
                         Some((heap.watch_slot(index), view_at(dword)))
-                    });
+                    };
+                    let input = target.input_dword.and_then(watched);
+                    let extra = target.extra_dword.and_then(watched);
                     self.traced_binding = Some(crate::capture::lineage::Binding {
-                        frame, target, slot: heap.watch_slot(index), guest, input,
+                        frame, target, slot: heap.watch_slot(index), guest, input, extra,
                     });
                 }
                 // SAFETY: an open list; `values` covers the parameter.
@@ -3230,6 +3232,10 @@ impl State {
         let pass = (kind == DISPATCH).then(|| self.begin_pass_region(list, p)).flatten();
         #[cfg(feature = "diagnostics")]
         let observed = self.trace_draw(list, kind == DISPATCH);
+        #[cfg(feature = "diagnostics")]
+        if let Some(trace) = &observed {
+            trace.indirect(list, &bounded, at, second.map(|(_, delta)| delta), max, counter.is_some());
+        }
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
         unsafe {
