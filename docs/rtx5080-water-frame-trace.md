@@ -1,5 +1,7 @@
 # Dark water patches at the helm on RTX 5080
 
+The follow-up replay measured depth at the same 495 sites and identified which shader store wrote black. [Native depth and store results](rtx5080-water-depth-input.md)
+
 On a native RTX 5080 at the stationary boat helm, the water-transmission compute dispatch turned 495 of 550 previously colored texels in one visible dark patch to exact zero. All four water-resolve draws then received the same texture, byte-for-byte. The end preview matched the preceding dispatch output at all 142,080 sampled sites. A later dispatch filled the isolated patch with color after the copy for this presentation. An adjacent open-water control stayed colored. The broad patch was already black when the preceding dispatch began.
 
 The test used an ASUS ROG Astral RTX 5080, driver 617.14, Ryzen 9 5900X, 32 GB RAM and native Windows 11 build 26200. Renderer `ba723deae61ac9206b677b8c30fa4f078ffcf66a` builds on the guarded water-copyback branch. A verified writable copy of a warm Series X profile reached the stationary boat and the "Collect the package" objective with `VICTORY_TEXTURE_BACK=64x64f16,128x128f36`. DRED was enabled. The diagnostic run ended deliberately. The original save was verified after exit.
