@@ -1919,6 +1919,8 @@ struct Deferred {
     indirect_traces: Vec<crate::indirect::DispatchTrace>,
     #[cfg(feature = "diagnostics")]
     light_samples: Vec<crate::light_probe::Readback>,
+    #[cfg(feature = "diagnostics")]
+    face_samples: Vec<crate::face_probe::Readback>,
     /// Whether the indirect-work budget is zeroed for this recording (a
     /// step on the CPU, or in the list for the card's copy).
     budget_zeroed: bool,
@@ -3575,6 +3577,10 @@ fn read_backs(list: &HostList) {
     }
     #[cfg(feature = "diagnostics")]
     for sample in &deferred.light_samples {
+        sample.report();
+    }
+    #[cfg(feature = "diagnostics")]
+    for sample in &deferred.face_samples {
         sample.report();
     }
     for (buffer, at, [row, rows, pitch]) in &deferred.backs {
@@ -6476,6 +6482,11 @@ impl HostList {
     #[cfg(feature = "diagnostics")]
     pub(crate) fn defer_light_sample(&self, sample: crate::light_probe::Readback) {
         self.deferred().light_samples.push(sample);
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn defer_face_sample(&self, sample: crate::face_probe::Readback) {
+        self.deferred().face_samples.push(sample);
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.

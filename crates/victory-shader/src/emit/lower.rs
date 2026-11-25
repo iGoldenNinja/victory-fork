@@ -9998,7 +9998,7 @@ impl<'a> Lower<'a> {
         // they are, as unsigned integers, and the host is told, which shows
         // the shader a 16-bit float view there as its unsigned twin
         // ([`super::HostShader::half_views`]).
-        let halves = d16 && typed && used.is_some_and(|u| u.root == RootType::Table);
+        let halves = d16 && typed && used.is_some_and(|u| u.root == RootType::Table) && super::d16_uint();
         if halves && let Some(u) = used {
             self.half_views.insert((u.slot, u.table_offset_dwords));
         }

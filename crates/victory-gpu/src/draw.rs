@@ -2131,6 +2131,25 @@ impl State {
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         if let Some(stage) = p.stages.first()
+            && let Some(sequence) = crate::face_probe::sample(&stage.shader.hash)
+        {
+            let mut recorded = 0;
+            for u in &stage.translated().used {
+                if u.root != RootType::Table || !matches!(u.kind, ResourceType::Uav | ResourceType::Srv) {
+                    continue;
+                }
+                let Some(&Root::Table(table)) = self.roots_ref(true).get(usize::from(u.slot)) else { continue };
+                let Some(view) = table.checked_add(u64::from(u.table_offset_dwords) * 4)
+                    .filter(|&h| self.heap_of(h).is_some() && crate::texture::committed(h as *const u8, 12))
+                    .and_then(crate::descriptor::view) else { continue };
+                recorded += u32::from(crate::face_probe::record(list, &view, u, sequence));
+            }
+            if recorded == 0 {
+                once!(used = ?stage.translated().used, "face extractor has no eligible table buffer");
+            }
+        }
+        #[cfg(feature = "diagnostics")]
+        if let Some(stage) = p.stages.first()
             && let Some(sequence) = crate::light_probe::sample(&stage.shader.hash)
         {
             let named = stage.translated().used.iter().any(|u| {

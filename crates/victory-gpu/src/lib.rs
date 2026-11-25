@@ -19,6 +19,8 @@
 mod capture;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod light_probe;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod face_probe;
 #[cfg(windows)]
 mod cardmeter;
 pub mod console;

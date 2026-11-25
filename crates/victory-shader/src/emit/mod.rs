@@ -196,6 +196,13 @@ pub fn shader_opt() -> u32 {
     *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
 }
 
+/// Use the PR 927 unsigned channel path. A local diagnostics run may set
+/// VICTORY_D16_TYPED_BITS=0 to reproduce the original float path in the same build.
+pub fn d16_uint() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_D16_TYPED_BITS").is_none_or(|s| s != "0"))
+}
+
 /// Everything a translation depends on besides the container: the
 /// translator's own source (hashed at build time), the value of every
 /// `VICTORY_*` switch it reads, the host facts the device hands it (widest
