@@ -36,3 +36,21 @@ I repeated the route on the identical `f85101b` executable with `VICTORY_QUEUE2=
 The queue reported a median 14.5 readback jobs transferring 74.9 MiB per frame over 77 samples. Upload jobs on the copy queue stayed at zero. The relay also reported a median 59.8 pieces per frame fetched again at their own landing. Both runs reached controllable prison and showed the same eight distinct pipeline refusals, with zero logged device removals. The blocky band below the courtyard window and stepped character edges appeared in both settings. The post-retreat frames showed similar room geometry and lighting.
 
 The copy-queue run had much shorter fetch waits and copy-back time, alongside higher GPU busy time and worse displayed frame pacing. Each setting ran once, in fixed order.
+
+## Async submission by itself
+
+I used the same `f85101b` executable and 3,067-file cache seed. The three runs were default, async submission and a repeated default control. The async arm added only `VICTORY_ASYNC_SUBMIT=1` to the renderer settings. Its runtime log confirmed that the submission thread started. Both defaults retained synchronous submission. All three used effective relay mode 2, had 2,124 hits and zero misses at the first shader-cache tally, and recorded the same eight `E_INVALIDARG` pipeline refusals.
+
+| 90-second prison route | Earlier default | Async submit | Repeated default |
+| --- | ---: | ---: | ---: |
+| Displayed application frames | 349 | 328 | 347 |
+| Displayed FPS | 3.86 | 3.63 | 3.84 |
+| P99 displayed frame time | 376.31 ms | 505.66 ms | 446.76 ms |
+| Mean GPU busy per displayed frame | 195.54 ms | 201.76 ms | 195.42 ms |
+| Median relay fetch wait | 131.20 ms | 132.45 ms | 131.90 ms |
+| Median copy-back | 170.90 ms | 176.55 ms | 172.10 ms |
+| Median reported draws per frame | 5,845 | 5,592 | 6,256 |
+
+The repeated control and async runs matched the first pan within 7 ms and later inputs within 20 ms. The three routes reached controllable prison and completed without logged device removal. Early async screenshots showed a performance overlay. It was absent from the matched post-retreat screenshots and the repeated control's early screenshots. The courtyard tile band and stepped character edges persisted. The sampled room lighting and geometry looked similar.
+
+Neither default replay was as slow as the async replay on this route. Draw counts and display pacing varied across the runs. The sample has two default runs and one async run, with no continuous measurement of the overlay's state.
