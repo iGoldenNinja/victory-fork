@@ -45,3 +45,38 @@ The median per-dispatch black fraction across that crop fell from 3.12% to 1.22%
 Under throttle the boat moved toward the bridge with twin wakes. Across the moving capture, black at positive depth fell from 195,045/8,174,664 observations (2.39%, 16 original dispatches) to 28,003/3,018,281 (0.93%, six retention dispatches). New black writes fell from 88,162 to zero. The views moved between samples. During a cinematic camera change, 429 positive-depth texels in one retention dispatch kept the exact diagnostic color that was already there, and four did so in another. This demonstrates stale color surviving in the destination. Retention is a partial workaround while the upstream water samples are being investigated.
 
 All seven focused capture tests passed. The offset-depth fixture also passed when explicitly run on hardware and WARP. The full GPU-library run had 199 passes, seven ignored and one failed WARP indirect-draw budget assertion. The same assertion failed on the preceding renderer and its code-equivalent parent. All three title runs ended deliberately and the protected save passed its hash check after each exit.
+
+## Four individual taps and a current-frame fallback
+
+A fourth replay on the same RTX 5080 recorded the alpha values actually loaded from dword 24, the source depths at dword 48 and the interpolation factors for the four reconstruction taps. The alpha texture is 1280 × 720 R10G10B10A2_UNORM. Each alpha code can take four values. The diagnostic preserved every code, the positive-interpolation mask and the positive-finite-depth mask. An exhaustive CPU check recovered all 131,072 combinations of the packed diagnostic fields.
+
+| Scene | No positive reconstruction weight | All four alpha codes zero | All four source depths positive and finite | All four interpolation factors positive |
+| --- | ---: | ---: | ---: | ---: |
+| Stationary boat | 223,286 | 223,286 | 223,286 | 223,286 |
+| Moving boat | 122,251 | 122,251 | 122,251 | 122,251 |
+
+These are repeated texel observations within the sampled crop. Across 9,791,236 positive-weight controls, zero had four zero alpha codes. At the original 495 coordinates, the individual-tap witness caught 396 failing observations together in one dispatch. Every one had the same four-zero alpha signature. The earlier combined-weight witness had independently caught all 495 failing together.
+
+In the dispatch with those 396 observations, the two preceding water-volumetric dispatches bound the same half-resolution alpha and depth allocations that the reconstruction shader subsequently read. Their output slots were dwords 152 and 120 respectively. Both used indirect dispatch. Across ten stationary witness dispatches held out from the initial edge search, 2,645/2,952 horizontal-coordinate transitions and 5,703/7,950 vertical-coordinate transitions lay exactly one full-resolution pixel from a multiple of 32. The corresponding moving counts were 1,680/2,019 and 2,856/4,246.
+
+The same capture identifies an earlier operation for testing. Tile generation (`1aa247ed3653b616`, dispatch 20 × 12 × 1) bound a 58,880-byte buffer at output dword 32. Both volumetric programs subsequently bound that exact buffer range at input dword 16. Inspection of their compiled host programs shows that each Wave32 group addresses two pixels per lane in an 8 × 8 half-resolution tile. One program reads forward through the packed coordinate list and the other indexes backward from a supplied count. Each also has a path that can explicitly write zero alpha at output dword 152. A capture of list membership plus the before/after alpha around each writer would distinguish a missing tile from an actual zero write.
+
+We also tested replacing the failed full-shading result with the current scene color sampled at the same pixel, scaled by the shader's exposure terms. The replacement requires positive finite water depth and final exposure, an unusable accumulated weight and exact black in all three normal output channels. At the stationary helm the following counts use 24 original and 12 treatment dispatches from the same replay. The comparison excludes the first and last four scene ticks of each 32-tick phase.
+
+| Region | Original black / positive-depth samples | Current-frame fallback |
+| --- | ---: | ---: |
+| Whole 1,184 × 480 crop | 466,667 / 12,767,573 (3.66%) | 203,633 / 6,383,182 (3.19%) |
+| Fixed open-water strip | 28,070 / 3,110,400 (0.90%) | 868 / 1,555,200 (0.056%) |
+| Original 495 coordinates | 396 / 11,880 (3.33%) | 378 / 5,940 (6.36%) |
+
+The fixed strip improved, while the small original coordinate set had a higher black fraction during the treatment phases. These windows sample different frames. The fallback can display an underlying scene surface. Reconstructing the intended water still depends on the half-resolution inputs.
+
+A fifth replay repeated the throttle comparison after three successive helm images matched the reference. Throttle began at scene tick 719, near the end of the original washout phase. The boat accelerated toward the bridge and developed twin wakes. The measurement excluded the first three seconds of throttle and the transition ticks of every phase. The earlier moving replay had provided source-alpha evidence but had missed the treatment window.
+
+| Region under throttle | Original, 15 dispatches | Current-frame fallback, 12 dispatches |
+| --- | ---: | ---: |
+| Whole crop | 149,135 / 7,585,155 (1.97%) | 113,051 / 6,375,509 (1.77%) |
+| Fixed open-water strip | 2,926 / 1,943,996 (0.15%) | 0 / 1,555,200 |
+| Original 495 coordinates | 495 / 7,425 (6.67%) | 0 / 5,940 |
+
+The moving repeat caught another 41,948 failed-weight observations. Every one had four zero alphas, four positive interpolation factors and four finite positive source depths. None of the 2,432,317 positive-weight controls had four zero alphas. The one moving treatment window covered different positions along the route from the original windows. The whole-crop improvement was modest, visible black marks persisted in the scene, and the original coordinates gave mixed results across the stationary and moving replays. Both additional runs ended deliberately and verified the protected save. The current-frame treatment remains experimental.
