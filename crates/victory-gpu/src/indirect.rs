@@ -1179,18 +1179,23 @@ void main() {
             assert_eq!(run(&mut warp, 1), vec![0; PIECES as usize]);
             // Piece `FIRST + i` of the copy covers offsets [lo, hi) as the
             // compare cuts them; a byte there changed flags that piece alone.
-            for (k, step) in [0usize, 1, 15, 16, 1023, 1024, 4095, 30001, 65535].iter().enumerate() {
-                let i = (k % PIECES as usize) as u32;
-                let lo = ((FIRST + i) as usize * PIECE).saturating_sub(SKEW as usize);
-                let at = lo + step % (PIECE - 16);
-                // SAFETY: inside the mapping.
-                unsafe { now_ptr.add(at).write_volatile(content[at] ^ 0x5a) };
-                let flagged = run(&mut warp, 1);
-                assert_eq!(flagged[i as usize], 1, "{source:.20}: byte {at:#x} of piece {i} not found");
-                // SAFETY: inside the mapping.
-                unsafe { now_ptr.add(at).write_volatile(content[at]) };
-                assert_eq!(run(&mut warp, 1), vec![0; PIECES as usize]);
+            let offsets = [0, 1, 15, 16, 1023, 1024, 4095, 30001, PIECE - 17,
+                           PIECE - 16, PIECE - 15, PIECE - 2, PIECE - 1];
+            for piece in 0..PIECES as usize {
+                let start = (FIRST as usize + piece) * PIECE - SKEW as usize;
+                let mut expected = vec![0; PIECES as usize];
+                expected[piece] = 1;
+                for offset in offsets {
+                    let at = start + offset;
+                    // SAFETY: each tested piece lies completely inside this mapping.
+                    unsafe { now_ptr.add(at).write_volatile(content[at] ^ 0x5a) };
+                    assert_eq!(run(&mut warp, 1), expected, "piece {piece}, offset {offset:#x}");
+                    // SAFETY: restore the same mapped byte after the GPU completed.
+                    unsafe { now_ptr.add(at).write_volatile(content[at]) };
+                    assert_eq!(run(&mut warp, 1), vec![0; PIECES as usize]);
+                }
             }
+            eprintln!("WARP verified {} single-byte changes and restores across four pieces", offsets.len() * PIECES as usize);
         }
     }
 
