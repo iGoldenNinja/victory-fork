@@ -1,0 +1,103 @@
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+mod census {
+    use std::collections::BTreeMap;
+    use std::sync::{Mutex, MutexGuard};
+    #[derive(Default)]
+    @Copy@
+    struct Census { copies: BTreeMap<u64, Copy> }
+    static CENSUS: Mutex<Census> = Mutex::new(Census { copies: BTreeMap::new() });
+    fn census() -> MutexGuard<'static, Census> { CENSUS.lock().unwrap() }
+    fn report_if_due() {}
+    @on@
+    @fetched@
+    @compared@
+    pub fn reading(start: u64) -> (u64, u64, u64) {
+        census().copies.get(&start).map(|s| (s.fetched, s.fetched_pieces, s.compared)).unwrap_or_default()
+    }
+}
+
+mod shadow {
+    use super::*;
+    const PIECE: usize = 65536;
+    #[derive(Clone)]
+    @CardSpan@
+    @piece_at@
+    @card_piece_of@
+    @outside@
+    pub struct Shadow(pub u64, pub usize, pub Mutex<Vec<(usize, usize)>>);
+    impl Shadow {
+        pub fn title_start(&self) -> u64 { self.0 }
+        pub fn card_piece(&self, span: &CardSpan, p: u32) -> (usize, usize) {
+            card_piece_of(self.0 as usize, self.1, span, p)
+        }
+        pub fn card_merge_relay(&self, lo: usize, bytes: &[u8], _seq: u64, _scratch: &mut Vec<u8>) -> usize {
+            assert!(bytes.iter().all(|&byte| byte == 0xA7));
+            self.2.lock().unwrap().push((lo, lo + bytes.len()));
+            0  // This simulated title already holds the same bytes.
+        }
+    }
+    pub static CARD_STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+    pub fn relay_fetched(_: u64) {}
+}
+
+struct CardRange { at: u32, shadow: Arc<shadow::Shadow>, span: shadow::CardSpan, compared: bool }
+struct CardPlan { ranges: Vec<CardRange>, inflight: bool, inflight_landed: u32, sent_as: u64 }
+struct Inflight {
+    table: ((), usize), fetched: ((), usize, u32), brought: Vec<(Arc<shadow::Shadow>, usize, usize, u64)>
+}
+struct Work { differs: ((), usize, usize), inflight: Option<Inflight> }
+static CARD_WORK: Mutex<Option<Work>> = Mutex::new(None);
+const INFLIGHT_SLOT: u64 = 65552;
+const INFLIGHT_NONE: u32 = u32::MAX;
+static INFLIGHT_STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+static COPY_BACK: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+fn copy_back(_: usize, written: u64) { assert_eq!(written, 0); }
+@inflight_piece_from@
+@inflight_gets_slot@
+@flagged_pieces@
+struct Host;
+impl Host { @relay_card_inflight@ }
+
+fn run(expired_ticket: bool) {
+    let base = if expired_ticket { 0x100000 } else { 0x200000 };
+    let a = Arc::new(shadow::Shadow(base, 65536, Mutex::new(vec![])));
+    let b = Arc::new(shadow::Shadow(base + 65536, 65536, Mutex::new(vec![])));
+    let range = |index, shadow: &Arc<shadow::Shadow>, from, to| CardRange {
+        at: index, shadow: shadow.clone(), compared: true,
+        span: shadow::CardSpan { from, to, first: 0, pieces: 1, skew: 0 }
+    };
+    let first = CardPlan {
+        ranges: vec![range(0, &a, 2, 30), range(1, &a, 2, 30)], // duplicate on the same shadow
+        inflight: true, inflight_landed: 0, sent_as: 8
+    };
+    let second = CardPlan {
+        ranges: vec![range(2, &b, 47, 61)], inflight: true, inflight_landed: 0, sent_as: 9
+    };
+    let flags = [1u32, 0, 1];
+    let table = [0u32, 0, u32::MAX, if expired_ticket { 3 } else { 1 }];
+    let slots = vec![0xA7u8; INFLIGHT_SLOT as usize * 2];
+    *CARD_WORK.lock().unwrap() = Some(Work {
+        differs: ((), flags.as_ptr() as usize, flags.len() * 4),
+        inflight: Some(Inflight { table: ((), table.as_ptr() as usize), fetched: ((), slots.as_ptr() as usize, 2),
+            brought: vec![(a.clone(), 8, 19, 9)] })
+    });
+    let landed = Host.relay_card_inflight(&[&first, &second]);
+    *CARD_WORK.lock().unwrap() = None;
+    assert_eq!(landed, !expired_ticket);
+    if expired_ticket {
+        assert!(a.2.lock().unwrap().is_empty());
+        assert_eq!(census::reading(base), (0, 0, 0));
+        assert_eq!(census::reading(base + 65536), (0, 0, 0));
+    } else {
+        assert_eq!(*a.2.lock().unwrap(), vec![(2, 8), (19, 30)]);
+        assert_eq!(*b.2.lock().unwrap(), vec![(47, 61)]);
+        assert_eq!(census::reading(base), (17, 2, 2));
+        assert_eq!(census::reading(base + 65536), (14, 1, 1));
+        assert_eq!(INFLIGHT_STATS[1].load(Ordering::Relaxed), 31);
+        assert_eq!(COPY_BACK[1].load(Ordering::Relaxed), 0);
+    }
+}
+#[test] fn completed_slots_credit_each_copy_for_the_usable_spans() { run(false); }
+#[test] fn late_fallback_does_not_credit_previously_validated_ranges() { run(true); }
