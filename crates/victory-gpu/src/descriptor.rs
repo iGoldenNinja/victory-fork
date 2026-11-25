@@ -1210,6 +1210,137 @@ mod tests {
         );
     }
 
+    /// A half view after the final declared range start must fit in the
+    /// fresh host table. The next allocation must not reuse its slot.
+    #[cfg(windows)]
+    #[test]
+    fn fresh_half_table_includes_the_last_accessed_descriptor() {
+        use victory_shader::{ResourceType, RootType, UsedResource};
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let mut heap_ptr: This = std::ptr::null();
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count: 4,
+            flags: SHADER_VISIBLE,
+            nodes: 0,
+        };
+        let placement = Placement { address: 0, size: 0 };
+        assert_eq!(create(desc, placement, &mut heap_ptr), S_OK);
+        let heap = heap(heap_ptr);
+        // Two different FLOAT SRVs. The first is read as numbers. The
+        // displaced one has a NaN payload, a subnormal and negative zero.
+        let source = [0xc000_bc00_4000_3c00u64, 0x8000_fc01_03ff_7e01];
+        for (i, word) in source.iter().enumerate() {
+            let address = std::ptr::from_ref(word) as u64;
+            crate::shadow::register(address as usize, address, 8);
+            let mut resource = [0; 14];
+            resource[0] = 1;
+            resource[4] = 8;
+            let mut view = [0; 16];
+            view[..3].copy_from_slice(&[10, 1, 5768]);
+            view[6] = 1;
+            view[10] = address as u32;
+            view[11] = (address >> 32) as u32;
+            create_placed_srv(std::ptr::null(), &resource, &view, heap.handle(2 * i as u32).unwrap());
+        }
+        let half = [(1, 16)];
+        let range = UsedResource {
+            root: RootType::Table,
+            kind: ResourceType::Srv,
+            slot: 1,
+            user_data: 4,
+            stride: 4,
+            dwords: 4,
+            lower_bound: 7,
+            table_offset_dwords: 0,
+        };
+        let used = vec![range];
+        let mut state = crate::draw::State::default();
+        state.set_heaps(&[heap_ptr]);
+        state.set_table(true, 1, heap.start);
+        let list = host.new_list().expect("a host list");
+        let fresh = state.tables(&list, &used, &[], &half, true);
+        assert_eq!(fresh.len(), 1);
+        let (root_slot, bytes) = fresh[0];
+        assert_eq!(root_slot, 1);
+        assert_eq!(state.tables(&list, &used, &[], &half, true), fresh);
+        let host_heap = heap.host().expect("a host heap");
+        let next = host_heap.dynamic(1).unwrap();
+        host_heap.release(next, 1);
+        let first = bytes / 32;
+        let slots = next - first;
+        let words = if slots >= 3 {
+            Some(read_half_table(host, &list, host_heap, first))
+        } else {
+            // Reading t2 here would access an unreserved descriptor.
+            list.close();
+            None
+        };
+        state.tables_done();
+        for word in &source {
+            let address = std::ptr::from_ref(word) as u64;
+            crate::shadow::unregister(address as usize, address);
+        }
+        slot::<extern "system" fn(This) -> u32>(heap_ptr, 0x10)(heap_ptr);
+        assert_eq!(slots, 3, "fresh table must hold the last accessed descriptor");
+        let words = words.unwrap();
+        eprintln!("fresh table readback: FLOAT bits {:x?}, UINT channels {:04x?}", &words[..4], &words[4..]);
+        assert_eq!(words[..4], [1.0f32, 2.0, -1.0, -2.0].map(f32::to_bits));
+        assert_eq!(words[4..], [0x7e01, 0x03ff, 0xfc01, 0x8000]);
+    }
+
+    #[cfg(windows)]
+    fn read_half_table(
+        host: &crate::host::Host,
+        list: &crate::host::HostList,
+        host_heap: &host::HostHeap,
+        first: u32,
+    ) -> [u32; 8] {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::core::s;
+        let code = crate::host::compile(r#"
+Buffer<float4> floats : register(t0);
+Buffer<uint4> halves : register(t2);
+RWByteAddressBuffer result : register(u0);
+[RootSignature("DescriptorTable(SRV(t0, numDescriptors=3)), UAV(u0)")]
+[numthreads(1, 1, 1)]
+void main() {
+    result.Store4(0, asuint(floats[0]));
+    result.Store4(16, halves[0]);
+}
+"#, s!("main"), s!("cs_5_1")).expect("the test shader");
+        let (buffer, readback) = host.shared_buffer(32).expect("readback buffer");
+        // SAFETY: the code contains the shader's root signature. Both
+        // slots are in the fresh host table; the readback holds 8 dwords
+        // and stays mapped until the synchronous execution finishes.
+        unsafe {
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, &code).unwrap();
+            let pso: ID3D12PipelineState = host.device.CreateComputePipelineState(
+                &D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: code.as_ptr().cast(),
+                        BytecodeLength: code.len(),
+                    },
+                    ..Default::default()
+                },
+            ).unwrap();
+            readback.write_bytes(0xcd, 32);
+            list.list.SetDescriptorHeaps(&[Some(host_heap.heap.clone())]);
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetPipelineState(&pso);
+            list.list.SetComputeRootDescriptorTable(0, host_heap.gpu_handle(first));
+            list.list.SetComputeRootUnorderedAccessView(1, buffer.GetGPUVirtualAddress());
+            list.list.Dispatch(1, 1, 1);
+            list.close();
+            host.execute(&[list]);
+            host.device.GetDeviceRemovedReason().expect("device after dispatch");
+            readback.cast::<[u32; 8]>().read_unaligned()
+        }
+    }
+
     #[test]
     fn heaps_hold_count_descriptors_from_their_start() {
         let null = std::ptr::null();
