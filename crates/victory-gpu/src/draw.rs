@@ -2067,6 +2067,18 @@ impl State {
     }
 
     /// Runs a dispatch on the host.
+    #[cfg(feature = "diagnostics")]
+    fn begin_pass_region(&self, list: &HostList, p: &crate::pipeline::host::HostPipeline) -> Option<crate::capture::pass::Pending> {
+        let (frame, cfg) = crate::capture::pass::selected(&p.stages.first()?.shader.hash)?;
+        let Root::Table(table) = self.roots_ref(true).get(usize::from(cfg.table))? else { return None };
+        let view = |offset: u32| {
+            let handle = table.checked_add(u64::from(offset) * 4)?;
+            self.heap_of(handle)?;
+            crate::texture::committed(handle as *const u8, 12).then(|| crate::descriptor::view(handle)).flatten()
+        };
+        crate::capture::pass::begin(list, frame, cfg, view(cfg.srv), view(cfg.uav))
+    }
+
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         // It may write the arguments a window holds clamped.
         self.window = None;
@@ -2120,8 +2132,12 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        #[cfg(feature = "diagnostics")]
+        let pass = self.begin_pass_region(list, p);
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        #[cfg(feature = "diagnostics")]
+        if let Some(pass) = pass { pass.end(list); }
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         if let Some(stage) = p.stages.first()
@@ -3162,6 +3178,8 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, true);
         }
+        #[cfg(feature = "diagnostics")]
+        let pass = (kind == DISPATCH).then(|| self.begin_pass_region(list, p)).flatten();
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
         unsafe {
@@ -3196,6 +3214,8 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
+        #[cfg(feature = "diagnostics")]
+        if let Some(pass) = pass { pass.end(list); }
         // The scratch buffer stays readable as arguments: the next draw of
         // the window reads it with no barrier, and the next clamp moves it
         // back (`crate::indirect`).
