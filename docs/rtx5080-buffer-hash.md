@@ -15,6 +15,10 @@ A separate prison-cell pair increased displayed FPS from 3.204 to 3.696 (+15.4%)
 
 The percentiles are intervals between fresh displayed application frames. GPU columns report the median of the renderer’s periodic per-frame GPU timing summaries. In time order, the stationary windows contained 481, 578, 592 and 479 displayed frames. The moving windows contained 150, 186, 194 and 168. A few long frames have a large effect on each moving P99.
 
+Extending the moving analysis to the entire 52-second throttle command gave P99s of 981.9, 652.7, 640.9 and 329.3 ms in run order. The 45-second windows contained 6, 4, 4 and 0 display gaps over 500 ms, all between 27.6 and 37.2 seconds after throttle began. The longer window added no further gaps over 500 ms. Two of the fourteen gaps overlapped a window snapshot, both in the first serial run. All three gaps above one second fell outside snapshot acquisition. Both wide runs stayed in hardware-composed independent flip throughout their moving windows.
+
+On the displayed row ending the longest gap in each affected run, PresentMon reported 1,561, 1,010 and 1,045 ms of CPU busy time and 191, 132 and 132 ms of GPU busy time, respectively. The renderer logged no shader translation or host pipeline creation completion inside the fourteen long gaps. These observations narrow down when to trace the host thread. They do not identify a blocking call or exclude work that completed later.
+
 | Run | Compared pieces | Fetched pieces | Draws / missing pipeline / dropped indirect | Other GPU lists (ms) | Water detail, left / right | Sky detail (luma) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | 1 | 17,826 | 706 | 3869 / 77 / 0 | 104.6 | 2.28% / 2.26% | 0.17 |
