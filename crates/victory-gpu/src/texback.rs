@@ -18,11 +18,40 @@
 //! what the list's last write left; a title read in between sees the frame
 //! before, as it would before the console's GPU has run.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::object::This;
+
+mod destination;
+use destination::{Registry, Ticket};
+
+static DESTINATIONS: OnceLock<Registry> = OnceLock::new();
+
+pub(crate) fn released(owner: usize) {
+    if let Some(pending) = DESTINATIONS.get() {
+        pending.released(owner);
+    }
+}
+
+pub(crate) fn installed(resource: This, at: usize) {
+    if kinds().is_empty() {
+        return;
+    }
+    let size = if wanted(resource) {
+        crate::resource::title_texture(resource).map(|(_, _, n)| n)
+    } else {
+        None
+    };
+    DESTINATIONS.get_or_init(Registry::new).installed(resource as usize, at, size);
+}
+
+pub(crate) fn remapped(at: usize, size: usize) {
+    if let Some(pending) = DESTINATIONS.get() {
+        pending.remapped(at, size);
+    }
+}
 
 /// The kinds copied back: (width, height, format).
 fn kinds() -> &'static [(u64, u32, u32)] {
@@ -51,29 +80,52 @@ pub(crate) fn wanted(resource: This) -> bool {
         && crate::resource::texture_kind(resource).is_some_and(|k| kinds.contains(&k))
 }
 
+/// Capture the guest destination at shader-write recording time. Retaining
+/// only the host copy lets the title destroy its own resource normally.
+pub(crate) struct Target {
+    pub(crate) copy: Arc<crate::resource::HostTexture>,
+    layout: victory_formats::texture::Layout,
+    kind: (u64, u32, u32),
+    ticket: Ticket,
+}
+
+impl Target {
+    pub(crate) fn new(resource: This) -> Option<Self> {
+        let copy = crate::resource::host_copy(resource)?;
+        let _mapping = crate::watch::title_memory_reading_now()?;
+        let kind = crate::resource::texture_kind(resource)?;
+        let (layout, at, size) = crate::resource::title_texture(resource)?;
+        let ticket = DESTINATIONS.get()?.capture(resource as usize, at, size)?;
+        Some(Self { copy, layout, kind, ticket })
+    }
+
+    pub(crate) fn matches(&self, owner: This) -> bool {
+        self.ticket.matches(owner as usize)
+    }
+}
+
 /// A texture's copy into a read-back buffer, recorded into a list, and where
 /// its texels go once the list has run.
 pub(crate) struct Back {
     buffer: ID3D12Resource,
-    // The guest resource owns its backing allocation or placed-heap reference.
-    _owner: crate::resource::WaterResource,
+    ticket: Ticket,
     footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
     total: usize,
     layout: victory_formats::texture::Layout,
-    at: usize,
-    size: usize,
 }
 
 pub(crate) fn record(
     list: &ID3D12GraphicsCommandList,
-    resource: crate::resource::WaterResource,
-    texture: &ID3D12Resource,
+    target: Target,
 ) -> Option<Back> {
+    if !target.ticket.is_current() {
+        return None;
+    }
     let host = crate::host::host()?;
-    let (layout, at, size) = crate::resource::title_texture(resource.get())?;
+    let texture = &target.copy.texture;
     // SAFETY: the list owns the host texture.
     let desc = unsafe { texture.GetDesc() };
-    let (width, height, format) = crate::resource::texture_kind(resource.get())?;
+    let (width, height, format) = target.kind;
     if desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
         || desc.MipLevels != 1 || desc.DepthOrArraySize != 1 || desc.SampleDesc.Count != 1
         || (desc.Width, desc.Height, desc.Format.0 as u32) != (width, height, format)
@@ -106,7 +158,7 @@ pub(crate) fn record(
     };
     // SAFETY: open list with the source in COPY_SOURCE.
     unsafe { list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
-    Some(Back { buffer, _owner: resource, footprint, total: total as usize, layout, at, size })
+    Some(Back { buffer, ticket: target.ticket, footprint, total: total as usize, layout: target.layout })
 }
 
 /// Merge the completed plane with the current guest padding while mappings are stable.
@@ -118,12 +170,22 @@ pub(crate) fn land(back: &Back) {
     let Some(_reading) = crate::watch::title_memory_reading_now() else {
         return;
     };
-    let mut tiled = vec![0u8; back.size];
+    // Lock in the same order as a mapping change: mapping first, tickets second.
+    let Some(_destination) = DESTINATIONS.get().and_then(|pending| pending.landing(&back.ticket)) else {
+        static STALE: AtomicU64 = AtomicU64::new(0);
+        let skipped = STALE.fetch_add(1, Ordering::Relaxed) + 1;
+        if skipped.is_power_of_two() {
+            tracing::info!(skipped, "water readback skipped after destination changed");
+        }
+        return;
+    };
+    let at = back.ticket.at;
+    let mut tiled = vec![0u8; back.ticket.size];
     let mut done = 0;
     // SAFETY: the kernel checks guest pages and tiled owns the full destination.
     let process = unsafe { GetCurrentProcess() };
     let ok = unsafe {
-        ReadProcessMemory(process, back.at as _, tiled.as_mut_ptr().cast(), tiled.len(), &mut done)
+        ReadProcessMemory(process, at as _, tiled.as_mut_ptr().cast(), tiled.len(), &mut done)
     };
     if ok == 0 || done != tiled.len() {
         return;
@@ -143,14 +205,14 @@ pub(crate) fn land(back: &Back) {
     if result.is_err() {
         return;
     }
-    crate::watch::writing(back.at, back.size);
+    crate::watch::writing(at, tiled.len());
     // SAFETY: tiled is valid for size bytes; the kernel checks the guest destination.
     done = 0;
     let ok = unsafe {
-        WriteProcessMemory(process, back.at as _, tiled.as_ptr().cast(), tiled.len(), &mut done)
+        WriteProcessMemory(process, at as _, tiled.as_ptr().cast(), tiled.len(), &mut done)
     };
     if done != 0 {
-        crate::watch::wrote(back.at, done);
+        crate::watch::wrote(at, done);
     }
     if ok != 0 && done == tiled.len() {
         static WRITES: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];

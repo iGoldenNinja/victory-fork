@@ -2293,6 +2293,8 @@ fn hand_out_resource(
             placed: std::sync::atomic::AtomicBool::new(false),
         },
     });
+    #[cfg(windows)]
+    crate::texback::installed(std::ptr::from_ref::<Resource>(&resource) as This, resource.data() as usize);
     // The host copy waits for the texture's first use ([`Hosted`]).
     #[cfg(windows)]
     if desc.dimension != BUFFER {
@@ -2322,7 +2324,9 @@ impl Drop for Resource {
         // Out of the table of textures first: the sweep looks at the ones
         // in it, under its lock.
         if self.desc.dimension != BUFFER {
-            textures().remove(&(std::ptr::from_ref::<Resource>(self) as usize));
+            let owner = std::ptr::from_ref::<Resource>(self) as usize;
+            crate::texback::released(owner);
+            textures().remove(&owner);
             if !fills(&self.desc) {
                 let mut targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
                 let at = self.data() as u64;
@@ -2574,29 +2578,6 @@ fn water_candidate(desc: &ResourceDesc) -> bool {
         && desc.sample_count == 1
         && matches!((desc.width, desc.height, desc.format),
             (64, 64, 16) | (128, 128, 36) | (256, 256, 16 | 41))
-}
-
-/// Keep the guest resource and its heap alive through list completion.
-#[cfg(windows)]
-pub(crate) struct WaterResource(usize);
-
-#[cfg(windows)]
-impl WaterResource {
-    pub(crate) fn retain(this: This) -> Self {
-        object::add_ref(this);
-        Self(this as usize)
-    }
-
-    pub(crate) fn get(&self) -> This {
-        self.0 as This
-    }
-}
-
-#[cfg(windows)]
-impl Drop for WaterResource {
-    fn drop(&mut self) {
-        resource_release(self.get());
-    }
 }
 
 /// Texture `this`'s console layout (one plane), where it lies in title
